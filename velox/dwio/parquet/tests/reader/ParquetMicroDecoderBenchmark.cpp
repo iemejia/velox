@@ -25,6 +25,7 @@
 //   - DirectDecoder (PLAIN fixed-width)
 
 #include <folly/Benchmark.h>
+#include <folly/BenchmarkUtil.h>
 #include <folly/Random.h>
 #include <folly/init/Init.h>
 
@@ -553,6 +554,137 @@ BENCHMARK_NAMED_PARAM(benchRleBpDecode, BitWidth_20, 20)
 BENCHMARK_DRAW_LINE();
 
 // ===========================================================================
+// StringDecoder SKIP benchmark (variable vs fixed length)
+// Uses manual timing to avoid folly BenchmarkSuspender measurement issues.
+// ===========================================================================
+
+// ===========================================================================
+// Dictionary gather benchmark (prefetch effectiveness)
+// Uses manual timing to avoid folly BenchmarkSuspender measurement issues.
+// ===========================================================================
+
+void runManualBenchmarks() {
+  constexpr int kNumStrings = 100'000;
+  constexpr int kStringSkipIters = 200;
+  constexpr int kDictGatherIters = 200;
+  constexpr int kNumValues = 100'000;
+
+  printf("\n--- Manual micro-benchmarks (not affected by folly suspender) ---\n");
+
+  // ---- String Skip: Variable-length ----
+  {
+    std::vector<std::string> storage(kNumStrings);
+    std::vector<std::string_view> values(kNumStrings);
+    for (int i = 0; i < kNumStrings; ++i) {
+      storage[i] = std::string(16, 'x');
+      values[i] = storage[i];
+    }
+    auto encoded = encodePlainStrings(values);
+
+    // Warmup.
+    for (int i = 0; i < 10; ++i) {
+      StringDecoder d(encoded.data(), encoded.data() + encoded.size());
+      d.skip(kNumStrings);
+    }
+
+    auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < kStringSkipIters; ++i) {
+      StringDecoder d(encoded.data(), encoded.data() + encoded.size());
+      d.skip(kNumStrings);
+      folly::doNotOptimizeAway(d);
+    }
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    double usPerIter = std::chrono::duration<double, std::micro>(elapsed).count()
+        / kStringSkipIters;
+    printf("  StringSkip(VarLen_16B, 100K):    %8.1f us/iter  (%6.2f ns/value)\n",
+        usPerIter, usPerIter * 1000.0 / kNumStrings);
+  }
+
+  // ---- String Skip: Fixed-length ----
+  {
+    constexpr int kFixedLen = 16;
+    std::vector<char> encoded(
+        static_cast<size_t>(kNumStrings) * kFixedLen, 'x');
+
+    // Warmup.
+    for (int i = 0; i < 10; ++i) {
+      StringDecoder d(encoded.data(), encoded.data() + encoded.size(), kFixedLen);
+      d.skip(kNumStrings);
+    }
+
+    auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < kStringSkipIters; ++i) {
+      StringDecoder d(encoded.data(), encoded.data() + encoded.size(), kFixedLen);
+      d.skip(kNumStrings);
+      folly::doNotOptimizeAway(d);
+    }
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    double usPerIter = std::chrono::duration<double, std::micro>(elapsed).count()
+        / kStringSkipIters;
+    printf("  StringSkip(FixedLen_16B, 100K):  %8.1f us/iter  (%6.2f ns/value)\n",
+        usPerIter, usPerIter * 1000.0 / kNumStrings);
+  }
+
+  printf("\n");
+
+  // ---- Dictionary Gather: with and without prefetch ----
+  auto runDictBench = [&](int dictSize, const char* label) {
+    std::vector<int64_t> dictionary(dictSize);
+    for (int i = 0; i < dictSize; ++i) {
+      dictionary[i] = i * 7 + 42;
+    }
+    std::vector<int32_t> indices(kNumValues);
+    for (int i = 0; i < kNumValues; ++i) {
+      indices[i] = folly::Random::rand32(dictSize);
+    }
+    std::vector<int64_t> output(kNumValues);
+    auto* dictPtr = dictionary.data();
+    auto* idxPtr = indices.data();
+
+    // With prefetch.
+    for (int i = 0; i < 10; ++i) {
+      for (int j = 0; j < kNumValues; ++j) {
+        output[j] = dictPtr[idxPtr[j]];
+      }
+    }
+    auto start = std::chrono::steady_clock::now();
+    for (int iter = 0; iter < kDictGatherIters; ++iter) {
+      constexpr int kPF = 8;
+      for (int i = 0; i < kNumValues; ++i) {
+        if (i + kPF < kNumValues) {
+          __builtin_prefetch(&dictPtr[idxPtr[i + kPF]], 0, 1);
+        }
+        output[i] = dictPtr[idxPtr[i]];
+      }
+      folly::doNotOptimizeAway(output[kNumValues / 2]);
+    }
+    auto elapsedPF = std::chrono::steady_clock::now() - start;
+    double usPF = std::chrono::duration<double, std::micro>(elapsedPF).count()
+        / kDictGatherIters;
+
+    // Without prefetch.
+    start = std::chrono::steady_clock::now();
+    for (int iter = 0; iter < kDictGatherIters; ++iter) {
+      for (int i = 0; i < kNumValues; ++i) {
+        output[i] = dictPtr[idxPtr[i]];
+      }
+      folly::doNotOptimizeAway(output[kNumValues / 2]);
+    }
+    auto elapsedNoPF = std::chrono::steady_clock::now() - start;
+    double usNoPF = std::chrono::duration<double, std::micro>(elapsedNoPF).count()
+        / kDictGatherIters;
+
+    printf("  DictGather(%s, 100K):  prefetch=%7.1f us  no_prefetch=%7.1f us  speedup=%.2fx\n",
+        label, usPF, usNoPF, usNoPF / usPF);
+  };
+
+  runDictBench(256, "256 entries / 2KB ");
+  runDictBench(4096, "4K entries / 32KB ");
+  runDictBench(65536, "64K entries / 512KB");
+  printf("\n");
+}
+
+// ===========================================================================
 // Main
 // ===========================================================================
 
@@ -560,5 +692,6 @@ int main(int argc, char** argv) {
   folly::Init init{&argc, &argv};
   memory::MemoryManager::initialize(memory::MemoryManager::Options{});
   folly::runBenchmarks();
+  runManualBenchmarks();
   return 0;
 }
