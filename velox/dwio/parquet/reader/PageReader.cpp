@@ -164,12 +164,14 @@ const char* PageReader::decompressData(
 
   switch (codec_) {
     case common::CompressionKind::CompressionKind_SNAPPY: {
+#ifndef NDEBUG
       size_t actualUncompressedSize;
-      VELOX_CHECK(
+      VELOX_DCHECK(
           snappy::GetUncompressedLength(
               pageData, compressedSize, &actualUncompressedSize),
           "Snappy: failed to get uncompressed length from corrupt data");
-      VELOX_CHECK_EQ(actualUncompressedSize, uncompressedSize);
+      VELOX_DCHECK_EQ(actualUncompressedSize, uncompressedSize);
+#endif
       VELOX_CHECK(
           snappy::RawUncompress(pageData, compressedSize, dest),
           "Snappy decompression failed");
