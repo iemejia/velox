@@ -23,6 +23,7 @@
 #include "velox/dwio/common/compression/Compression.h"
 #include "velox/dwio/parquet/common/RleEncodingInternal.h"
 #include "velox/dwio/parquet/reader/BooleanDecoder.h"
+#include "velox/dwio/parquet/reader/ByteStreamSplitDecoder.h"
 #include "velox/dwio/parquet/reader/DeltaBpDecoder.h"
 #include "velox/dwio/parquet/reader/DeltaByteArrayDecoder.h"
 #include "velox/dwio/parquet/reader/ParquetTypeWithId.h"
@@ -307,6 +308,19 @@ class PageReader {
       } else if (encoding_ == thrift::Encoding::DELTA_BINARY_PACKED) {
         nullsFromFastPath = false;
         deltaBpDecoder_->readWithVisitor<true>(nulls, visitor);
+      } else if (encoding_ == thrift::Encoding::BYTE_STREAM_SPLIT) {
+        nullsFromFastPath = false;
+        if constexpr (sizeof(typename Visitor::DataType) == 4) {
+          VELOX_CHECK_NOT_NULL(
+              floatBssDecoder_,
+              "floatBssDecoder_ is null for BYTE_STREAM_SPLIT float page");
+          floatBssDecoder_->readWithVisitor<true>(nulls, visitor);
+        } else {
+          VELOX_CHECK_NOT_NULL(
+              doubleBssDecoder_,
+              "doubleBssDecoder_ is null for BYTE_STREAM_SPLIT double page");
+          doubleBssDecoder_->readWithVisitor<true>(nulls, visitor);
+        }
       } else {
         directDecoder_->readWithVisitor<true>(
             nulls, visitor, nullsFromFastPath);
@@ -317,6 +331,12 @@ class PageReader {
         dictionaryIdDecoder_->readWithVisitor<false>(nullptr, dictVisitor);
       } else if (encoding_ == thrift::Encoding::DELTA_BINARY_PACKED) {
         deltaBpDecoder_->readWithVisitor<false>(nulls, visitor);
+      } else if (encoding_ == thrift::Encoding::BYTE_STREAM_SPLIT) {
+        if constexpr (sizeof(typename Visitor::DataType) == 4) {
+          floatBssDecoder_->readWithVisitor<false>(nulls, visitor);
+        } else {
+          doubleBssDecoder_->readWithVisitor<false>(nulls, visitor);
+        }
       } else {
         directDecoder_->readWithVisitor<false>(
             nulls, visitor, !this->type_->type()->isShortDecimal());
@@ -553,7 +573,8 @@ class PageReader {
   std::unique_ptr<DeltaByteArrayDecoder> deltaByteArrDecoder_;
   std::unique_ptr<DeltaLengthByteArrayDecoder> deltaLengthByteArrDecoder_;
   std::unique_ptr<RleBpDataDecoder> rleBooleanDecoder_;
-  // Add decoders for other encodings here.
+  std::unique_ptr<ByteStreamSplitDecoder<float>> floatBssDecoder_;
+  std::unique_ptr<ByteStreamSplitDecoder<double>> doubleBssDecoder_;
 };
 
 FOLLY_ALWAYS_INLINE dwio::common::compression::CompressionOptions

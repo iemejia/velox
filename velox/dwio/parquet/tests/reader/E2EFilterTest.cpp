@@ -377,6 +377,20 @@ TEST_F(E2EFilterTest, floatAndDouble) {
       20);
 }
 
+TEST_F(E2EFilterTest, DISABLED_floatByteStreamSplit) {
+  options_.enableDictionary = false;
+  options_.encoding =
+      facebook::velox::parquet::arrow::Encoding::kByteStreamSplit;
+
+  testWithTypes(
+      "float_val:float,"
+      "double_val:double",
+      [&]() {},
+      false,
+      {},
+      20);
+}
+
 TEST_F(E2EFilterTest, shortDecimalDictionary) {
   // decimal(8, 5) maps to 4 bytes FLBA in Parquet.
   // decimal(10, 5) maps to 5 bytes FLBA in Parquet.

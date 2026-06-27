@@ -942,6 +942,31 @@ void PageReader::makeDecoder() {
         break;
       }
       [[fallthrough]];
+    case Encoding::BYTE_STREAM_SPLIT:
+      switch (parquetType) {
+        case thrift::Type::FLOAT:
+          if (floatBssDecoder_) {
+            floatBssDecoder_->reset(pageData_, encodedDataSize_);
+          } else {
+            floatBssDecoder_ =
+                std::make_unique<ByteStreamSplitDecoder<float>>(
+                    pageData_, encodedDataSize_);
+          }
+          break;
+        case thrift::Type::DOUBLE:
+          if (doubleBssDecoder_) {
+            doubleBssDecoder_->reset(pageData_, encodedDataSize_);
+          } else {
+            doubleBssDecoder_ =
+                std::make_unique<ByteStreamSplitDecoder<double>>(
+                    pageData_, encodedDataSize_);
+          }
+          break;
+        default:
+          VELOX_UNSUPPORTED(
+              "BYTE_STREAM_SPLIT encoding only supports FLOAT and DOUBLE");
+      }
+      break;
     case Encoding::DELTA_LENGTH_BYTE_ARRAY:
       if (parquetType == thrift::Type::BYTE_ARRAY) {
         if (!deltaLengthByteArrDecoder_) {
@@ -998,6 +1023,10 @@ void PageReader::skip(int64_t numRows) {
     deltaLengthByteArrDecoder_->skip(toSkip);
   } else if (rleBooleanDecoder_) {
     rleBooleanDecoder_->skip(toSkip);
+  } else if (floatBssDecoder_) {
+    floatBssDecoder_->skip(toSkip);
+  } else if (doubleBssDecoder_) {
+    doubleBssDecoder_->skip(toSkip);
   } else {
     VELOX_FAIL("No decoder to skip");
   }
