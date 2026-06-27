@@ -56,6 +56,23 @@ if(VELOX_ENABLE_BENCHMARKS)
   add_executable(velox_dwio_parquet_reader_benchmark ParquetReaderBenchmarkMain.cpp)
   target_link_libraries(velox_dwio_parquet_reader_benchmark velox_dwio_parquet_reader_benchmark_lib)
 
+  add_executable(velox_dwio_parquet_decoder_benchmark ParquetReaderDecoderBenchmark.cpp)
+  target_link_libraries(
+    velox_dwio_parquet_decoder_benchmark
+    velox_dwio_parquet_reader_benchmark_lib
+    lz4::lz4
+    zstd::zstd
+    ZLIB::ZLIB
+  )
+
+  add_executable(velox_dwio_parquet_micro_decoder_benchmark ParquetMicroDecoderBenchmark.cpp)
+  target_link_libraries(
+    velox_dwio_parquet_micro_decoder_benchmark
+    velox_dwio_native_parquet_reader
+    Folly::folly
+    Folly::follybenchmark
+  )
+
   add_executable(velox_dwio_parquet_metadata_benchmark MetadataBenchmark.cpp)
   target_link_libraries(velox_dwio_parquet_metadata_benchmark velox_dwio_native_parquet_reader)
 endif()

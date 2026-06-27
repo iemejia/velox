@@ -179,8 +179,10 @@ void ParquetReaderBenchmark::readSingleColumn(
   writeToFile(*batches, true);
   std::vector<FilterSpec> filterSpecs;
 
-  // Filters on List and Map are not supported currently.
-  if (type->kind() != TypeKind::ARRAY && type->kind() != TypeKind::MAP) {
+  // Filters on List, Map, Boolean, and Timestamp are not supported currently.
+  if (type->kind() != TypeKind::ARRAY && type->kind() != TypeKind::MAP &&
+      type->kind() != TypeKind::BOOLEAN &&
+      type->kind() != TypeKind::TIMESTAMP) {
     filterSpecs.emplace_back(createFilterSpec(
         columnName, startPct, selectPct, rowType, false, false));
   }
@@ -227,6 +229,22 @@ void run(
   facebook::velox::parquet::test::ParquetReaderBenchmark benchmark(
       disableDictionary, rowType);
   BIGINT()->toString();
+  benchmark.readSingleColumn(
+      columnName, type, 0, filterRateX100, nullsRateX100, nextSize);
+}
+
+void run(
+    uint32_t,
+    const std::string& columnName,
+    const TypePtr& type,
+    float filterRateX100,
+    uint8_t nullsRateX100,
+    uint32_t nextSize,
+    bool disableDictionary,
+    common::CompressionKind compression) {
+  RowTypePtr rowType = ROW({columnName}, {type});
+  facebook::velox::parquet::test::ParquetReaderBenchmark benchmark(
+      disableDictionary, rowType, compression);
   benchmark.readSingleColumn(
       columnName, type, 0, filterRateX100, nullsRateX100, nextSize);
 }
