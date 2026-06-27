@@ -41,8 +41,14 @@ class StringDecoder {
     if (hasNulls) {
       numValues = bits::countNonNulls(nulls, current, current + numValues);
     }
-    for (auto i = 0; i < numValues; ++i) {
-      bufferStart_ += lengthAt(bufferStart_) + sizeof(int32_t);
+    if (fixedLength_ > 0) {
+      // Fixed-length strings: O(1) skip.
+      bufferStart_ += static_cast<int64_t>(numValues) * fixedLength_;
+    } else {
+      // Variable-length: must scan length prefixes sequentially.
+      for (auto i = 0; i < numValues; ++i) {
+        bufferStart_ += lengthAt(bufferStart_) + sizeof(int32_t);
+      }
     }
   }
 
