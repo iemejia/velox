@@ -41,7 +41,9 @@ class ParquetReaderBenchmark {
  public:
   explicit ParquetReaderBenchmark(
       bool disableDictionary,
-      const facebook::velox::RowTypePtr& rowType)
+      const facebook::velox::RowTypePtr& rowType,
+      velox::common::CompressionKind compression =
+          velox::common::CompressionKind_NONE)
       : disableDictionary_(disableDictionary) {
     rootPool_ = facebook::velox::memory::memoryManager()->addRootPool(
         "ParquetReaderBenchmark");
@@ -60,6 +62,7 @@ class ParquetReaderBenchmark {
     }
     dwio::common::WriterOptions writerOptions;
     writerOptions.memoryPool = rootPool_.get();
+    writerOptions.compressionKind = compression;
     writerOptions.formatSpecificOptions =
         std::make_shared<ParquetWriterOptions>(options);
     writer_ = std::make_unique<facebook::velox::parquet::Writer>(
@@ -133,5 +136,16 @@ void run(
     uint8_t nullsRateX100,
     uint32_t nextSize,
     bool disableDictionary);
+
+// Overload with compression support.
+void run(
+    uint32_t,
+    const std::string& columnName,
+    const facebook::velox::TypePtr& type,
+    float filterRateX100,
+    uint8_t nullsRateX100,
+    uint32_t nextSize,
+    bool disableDictionary,
+    velox::common::CompressionKind compression);
 
 } // namespace facebook::velox::parquet::test
