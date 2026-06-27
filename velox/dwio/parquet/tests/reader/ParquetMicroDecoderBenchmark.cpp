@@ -31,7 +31,7 @@
 #include "velox/common/base/BitUtil.h"
 #include "velox/common/memory/Memory.h"
 #include "velox/dwio/common/DecoderUtil.h"
-#include "velox/dwio/common/DirectDecoder.h"
+#include "velox/dwio/common/SelectiveColumnReader.h"
 #include "velox/dwio/parquet/reader/BooleanDecoder.h"
 #include "velox/dwio/parquet/reader/DeltaBpDecoder.h"
 #include "velox/dwio/parquet/reader/RleBpDataDecoder.h"
@@ -226,12 +226,12 @@ template <typename T>
 class BenchmarkVisitor {
  public:
   using DataType = T;
-  using FilterType = velox::common::AlwaysTrue;
-  using Extract = dwio::common::FixedWidth<sizeof(T)>;
+  using FilterType = facebook::velox::common::AlwaysTrue;
+  using HookType = dwio::common::NoHook;
   static constexpr bool dense = true;
   static constexpr bool kHasFilter = false;
   static constexpr bool kHasHook = false;
-  static constexpr bool kHasBulkPath = true;
+  static constexpr bool kHasBulkPath = false;
   static constexpr bool kFilterOnly = false;
 
   BenchmarkVisitor(T* output, int32_t numRows)
@@ -240,7 +240,7 @@ class BenchmarkVisitor {
     std::iota(rows_.begin(), rows_.end(), 0);
   }
 
-  const velox::common::AlwaysTrue& filter() const {
+  const facebook::velox::common::AlwaysTrue& filter() const {
     return filter_;
   }
 
@@ -279,11 +279,72 @@ class BenchmarkVisitor {
 
   void addRowNumber(int32_t) {}
 
+  // Stubs for fastPath compilation (never called due to kHasBulkPath=false).
+  int32_t numValuesBias() const {
+    return 0;
+  }
+
+  raw_vector<int32_t>& outerNonNullRows() {
+    static raw_vector<int32_t> v;
+    return v;
+  }
+
+  raw_vector<int32_t>& innerNonNullRows() {
+    static raw_vector<int32_t> v;
+    return v;
+  }
+
+  void setAllNull(int32_t) {}
+
+  void setHasNulls() {}
+
+  uint64_t* rawNulls(int32_t) {
+    return nullptr;
+  }
+
+  void setRows(folly::Range<const int32_t*>) {}
+
+  T* rawValues(int32_t) {
+    return output_;
+  }
+
+  int32_t* outputRows(int32_t) {
+    return nullptr;
+  }
+
+  bool atEnd() const {
+    return outputIdx_ >= numRows_;
+  }
+
+  template <bool, bool, bool>
+  void processRun(
+      const T*,
+      int32_t numInput,
+      const int32_t*,
+      int32_t*,
+      T*,
+      int32_t& numValues) {
+    numValues += numInput;
+  }
+
+  template <bool, bool, bool>
+  void processRle(
+      int64_t,
+      int64_t,
+      int32_t numInput,
+      int32_t,
+      const int32_t*,
+      int32_t*,
+      T*,
+      int32_t& numValues) {
+    numValues += numInput;
+  }
+
  private:
   T* output_;
   int32_t numRows_;
   int32_t outputIdx_ = 0;
-  velox::common::AlwaysTrue filter_;
+  facebook::velox::common::AlwaysTrue filter_;
   std::vector<int32_t> rows_;
 };
 
@@ -328,6 +389,37 @@ BENCHMARK_NAMED_PARAM(benchDeltaBpSequential, MediumDelta_max255, 255)
 
 // Large deltas (bitWidth ~16).
 BENCHMARK_NAMED_PARAM(benchDeltaBpSequential, LargeDelta_max65535, 65535)
+
+BENCHMARK_DRAW_LINE();
+
+// DeltaBpDecoder SKIP benchmarks -- measures the optimized skip path.
+void benchDeltaBpSkip(uint32_t, int maxDelta) {
+  folly::BenchmarkSuspender suspender;
+
+  std::vector<int64_t> values(kBenchNumValues);
+  values[0] = 1000;
+  for (int i = 1; i < kBenchNumValues; ++i) {
+    values[i] = values[i - 1] + (i % (maxDelta + 1));
+  }
+
+  auto encoded = encodeDeltaBinaryPacked(values);
+
+  suspender.dismiss();
+
+  // Skip all values (simulates sparse read that skips most of the page).
+  DeltaBpDecoder decoder(encoded.data());
+  decoder.skip(kBenchNumValues);
+  folly::doNotOptimizeAway(decoder.bufferStart());
+}
+
+// Constant-delta skip (O(1) fast path).
+BENCHMARK_NAMED_PARAM(benchDeltaBpSkip, Skip_ConstantDelta, 0)
+
+// Small-delta skip (batched decode path).
+BENCHMARK_NAMED_PARAM(benchDeltaBpSkip, Skip_SmallDelta_max7, 7)
+
+// Large-delta skip (batched decode path, wider bit widths).
+BENCHMARK_NAMED_PARAM(benchDeltaBpSkip, Skip_LargeDelta_max65535, 65535)
 
 BENCHMARK_DRAW_LINE();
 
@@ -457,35 +549,6 @@ BENCHMARK_NAMED_PARAM(benchRleBpDecode, BitWidth_8, 8)
 BENCHMARK_NAMED_PARAM(benchRleBpDecode, BitWidth_12, 12)
 BENCHMARK_NAMED_PARAM(benchRleBpDecode, BitWidth_16, 16)
 BENCHMARK_NAMED_PARAM(benchRleBpDecode, BitWidth_20, 20)
-
-BENCHMARK_DRAW_LINE();
-
-// ===========================================================================
-// DirectDecoder PLAIN INT64 benchmark
-//
-// Baseline for page-level decoder allocation overhead (optimization 1.1).
-// Measures raw decode throughput without the reader pipeline.
-// ===========================================================================
-
-BENCHMARK(DirectDecoder_PlainInt64_100k) {
-  folly::BenchmarkSuspender suspender;
-
-  std::vector<int64_t> values(kBenchNumValues);
-  for (int i = 0; i < kBenchNumValues; ++i) {
-    values[i] = i * 17 + 42;
-  }
-  auto encoded = encodePlainInt64(values);
-  std::vector<int64_t> output(kBenchNumValues);
-
-  suspender.dismiss();
-
-  auto stream = std::make_unique<dwio::common::SeekableArrayInputStream>(
-      encoded.data(), kBenchNumValues * sizeof(int64_t), 0);
-  dwio::common::DirectDecoder<true> decoder(std::move(stream), false, 8);
-  auto visitor = BenchmarkVisitor<int64_t>(output.data(), kBenchNumValues);
-  decoder.readWithVisitor<false>(nullptr, visitor);
-  folly::doNotOptimizeAway(output[0]);
-}
 
 BENCHMARK_DRAW_LINE();
 
