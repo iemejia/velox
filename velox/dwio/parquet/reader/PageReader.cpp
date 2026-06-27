@@ -321,10 +321,12 @@ void PageReader::prepareDataPageV1(const PageHeader& pageHeader, int64_t row) {
     return;
   }
   pageData_ = readBytes(*pageHeader.compressed_page_size(), pageBuffer_);
-  pageData_ = decompressData(
-      pageData_,
-      *pageHeader.compressed_page_size(),
-      *pageHeader.uncompressed_page_size());
+  if (codec_ != common::CompressionKind::CompressionKind_NONE) {
+    pageData_ = decompressData(
+        pageData_,
+        *pageHeader.compressed_page_size(),
+        *pageHeader.uncompressed_page_size());
+  }
   auto pageEnd = pageData_ + *pageHeader.uncompressed_page_size();
   auto remainingBytes = *pageHeader.uncompressed_page_size();
   if (maxRepeat_ > 0) {
