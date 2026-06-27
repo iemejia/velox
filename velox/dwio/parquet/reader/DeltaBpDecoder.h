@@ -37,6 +37,11 @@ class DeltaBpDecoder {
     initHeader();
   }
 
+  void reset(const char* start) {
+    bufferStart_ = start;
+    initHeader();
+  }
+
   void skip(uint64_t numValues) {
     skip<false>(numValues, 0, nullptr);
   }
@@ -47,9 +52,7 @@ class DeltaBpDecoder {
     if (hasNulls) {
       numValues = bits::countNonNulls(nulls, current, current + numValues);
     }
-    for (int32_t i = 0; i < numValues; ++i) {
-      readLong();
-    }
+    skipValues(numValues);
   }
 
   template <bool hasNulls, typename Visitor>
@@ -123,6 +126,62 @@ class DeltaBpDecoder {
 
  private:
   static constexpr int32_t kBatch = 1024;
+
+  /// Skip 'numValues' values efficiently. For constant-delta miniblocks
+  /// (bitWidth==0), compute the final value in O(1). For other cases, use
+  /// the batched decode path which is faster than per-value readLong().
+  void skipValues(int32_t numValues) {
+    if (numValues <= 0) {
+      return;
+    }
+
+    // Handle the first value (block header) if block is uninitialized.
+    if (!firstBlockInitialized_ && numValues > 0) {
+      readLong();
+      --numValues;
+      if (numValues <= 0) {
+        return;
+      }
+    }
+
+    while (numValues > 0) {
+      if (valuesRemainingCurrentMiniBlock_ == 0) {
+        advanceMiniBlock();
+      }
+
+      auto toSkipInBlock = std::min<int32_t>(
+          numValues,
+          std::min<int32_t>(
+              valuesRemainingCurrentMiniBlock_, totalValuesRemaining_));
+
+      if (deltaBitWidth_ == 0) {
+        // Constant-delta miniblock: compute lastValue in O(1).
+        lastValue_ = static_cast<int64_t>(
+            static_cast<uint64_t>(lastValue_) +
+            static_cast<uint64_t>(minDelta_) *
+                static_cast<uint64_t>(toSkipInBlock));
+        valuesRemainingCurrentMiniBlock_ -= toSkipInBlock;
+        totalValuesRemaining_ -= toSkipInBlock;
+        if (valuesRemainingCurrentMiniBlock_ == 0 ||
+            totalValuesRemaining_ == 0) {
+          bufferStart_ += bits::nbytes(deltaBitWidth_ * valuesPerMiniBlock_);
+        }
+      } else {
+        // Non-constant delta: use batched decode to skip (still must decode
+        // due to prefix-sum dependency, but batch decode is faster than
+        // per-value readLong due to fewer branches).
+        int64_t scratch[kBatch];
+        int32_t skipped = 0;
+        while (skipped < toSkipInBlock) {
+          auto batch =
+              std::min<int32_t>(kBatch, toSkipInBlock - skipped);
+          decodeLongs(scratch, batch);
+          skipped += batch;
+        }
+      }
+      numValues -= toSkipInBlock;
+    }
+  }
 
   template <typename Visitor>
   void readWithVisitorDenseBatched(Visitor& visitor) {
