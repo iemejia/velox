@@ -1182,17 +1182,8 @@ class DictionaryColumnVisitor
   void translateByDict(const T* values, int numValues, T* out) {
     using TIndex = typename make_index<T>::type;
     if (!inDict()) {
-      const auto* dictPtr = dict();
-      const auto* indices = reinterpret_cast<const TIndex*>(values);
-      // Software prefetch hides L2/L3 latency for dictionaries larger than L1
-      // cache. The prefetch distance of 8 covers ~200 cycle miss latency at
-      // ~10-25 cycles per iteration.
-      constexpr int kPrefetchDistance = 8;
       for (auto i = 0; i < numValues; ++i) {
-        if (i + kPrefetchDistance < numValues) {
-          __builtin_prefetch(&dictPtr[indices[i + kPrefetchDistance]], 0, 1);
-        }
-        out[i] = dictPtr[indices[i]];
+        out[i] = dict()[reinterpret_cast<const TIndex*>(values)[i]];
       }
     } else if (super::dense) {
       bits::forEachSetBit(
