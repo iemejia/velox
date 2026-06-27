@@ -23,6 +23,7 @@
 #include "velox/dwio/common/compression/Compression.h"
 #include "velox/dwio/parquet/common/RleEncodingInternal.h"
 #include "velox/dwio/parquet/reader/BooleanDecoder.h"
+#include "velox/dwio/parquet/reader/ByteStreamSplitDecoder.h"
 #include "velox/dwio/parquet/reader/DeltaBpDecoder.h"
 #include "velox/dwio/parquet/reader/DeltaByteArrayDecoder.h"
 #include "velox/dwio/parquet/reader/ParquetTypeWithId.h"
@@ -553,7 +554,11 @@ class PageReader {
   std::unique_ptr<DeltaByteArrayDecoder> deltaByteArrDecoder_;
   std::unique_ptr<DeltaLengthByteArrayDecoder> deltaLengthByteArrDecoder_;
   std::unique_ptr<RleBpDataDecoder> rleBooleanDecoder_;
-  // Add decoders for other encodings here.
+
+  /// Scratch buffer for BYTE_STREAM_SPLIT decoded data. Separate from
+  /// decompressedData_ to avoid overwriting the source when the page is
+  /// compressed.
+  BufferPtr bssDecodedData_;
 };
 
 FOLLY_ALWAYS_INLINE dwio::common::compression::CompressionOptions
