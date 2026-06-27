@@ -16,9 +16,12 @@
 
 #include "velox/dwio/parquet/reader/PageReader.h"
 
+#include <lz4.h>
 #include <snappy.h>
 #include <thrift/lib/cpp2/FieldRef.h>
 #include <zstd.h>
+
+#include <folly/lang/Bits.h>
 
 #include "velox/common/testutil/TestValue.h"
 #include "velox/common/time/Timer.h"
@@ -190,9 +193,50 @@ const char* PageReader::decompressData(
       VELOX_CHECK_EQ(actualUncompressedSize, uncompressedSize);
       break;
     }
+    case common::CompressionKind::CompressionKind_LZ4: {
+      // Parquet uses either Hadoop LZ4 frame format (legacy "LZ4" codec) or
+      // raw LZ4 blocks ("LZ4_RAW" codec). Both map to CompressionKind_LZ4.
+      // Try Hadoop frame format first, fall back to raw LZ4.
+      static constexpr uint32_t kHadoopPrefixLength = sizeof(uint32_t) * 2;
+      bool decompressedAsHadoop = false;
+      if (compressedSize >= kHadoopPrefixLength) {
+        const auto expectedDecompressedSize = folly::Endian::big(
+            folly::loadUnaligned<uint32_t>(pageData));
+        const auto expectedCompressedSize = folly::Endian::big(
+            folly::loadUnaligned<uint32_t>(pageData + sizeof(uint32_t)));
+        // Validate that the Hadoop frame header is consistent with what we
+        // know from the page header.
+        if (expectedDecompressedSize == uncompressedSize &&
+            expectedCompressedSize ==
+                compressedSize - kHadoopPrefixLength) {
+          const auto ret = LZ4_decompress_safe(
+              pageData + kHadoopPrefixLength,
+              dest,
+              static_cast<int>(expectedCompressedSize),
+              static_cast<int>(uncompressedSize));
+          VELOX_CHECK_EQ(
+              ret,
+              static_cast<int>(uncompressedSize),
+              "LZ4 Hadoop frame decompression failed");
+          decompressedAsHadoop = true;
+        }
+      }
+      if (!decompressedAsHadoop) {
+        // Raw LZ4 block (LZ4_RAW codec).
+        const auto ret = LZ4_decompress_safe(
+            pageData,
+            dest,
+            static_cast<int>(compressedSize),
+            static_cast<int>(uncompressedSize));
+        VELOX_CHECK_EQ(
+            ret,
+            static_cast<int>(uncompressedSize),
+            "LZ4 raw decompression failed");
+      }
+      break;
+    }
     default: {
-      // Fallback to stream-based decompression for other codecs (gzip, lz4,
-      // lzo).
+      // Fallback to stream-based decompression for other codecs (gzip, lzo).
       std::unique_ptr<dwio::common::SeekableInputStream> inputStream =
           std::make_unique<dwio::common::SeekableArrayInputStream>(
               pageData, compressedSize, 0);
