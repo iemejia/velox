@@ -840,23 +840,43 @@ void PageReader::makeDecoder() {
   switch (encoding_) {
     case Encoding::RLE_DICTIONARY:
     case Encoding::PLAIN_DICTIONARY:
-      dictionaryIdDecoder_ = std::make_unique<RleBpDataDecoder>(
-          pageData_ + 1, pageData_ + encodedDataSize_, pageData_[0]);
+      if (dictionaryIdDecoder_) {
+        dictionaryIdDecoder_->reset(
+            pageData_ + 1, pageData_ + encodedDataSize_, pageData_[0]);
+      } else {
+        dictionaryIdDecoder_ = std::make_unique<RleBpDataDecoder>(
+            pageData_ + 1, pageData_ + encodedDataSize_, pageData_[0]);
+      }
       break;
     case Encoding::PLAIN:
       switch (parquetType) {
         case thrift::Type::BOOLEAN:
-          booleanDecoder_ = std::make_unique<BooleanDecoder>(
-              pageData_, pageData_ + encodedDataSize_);
+          if (booleanDecoder_) {
+            booleanDecoder_->reset(pageData_, pageData_ + encodedDataSize_);
+          } else {
+            booleanDecoder_ = std::make_unique<BooleanDecoder>(
+                pageData_, pageData_ + encodedDataSize_);
+          }
           break;
         case thrift::Type::BYTE_ARRAY:
-          stringDecoder_ = std::make_unique<StringDecoder>(
-              pageData_, pageData_ + encodedDataSize_);
+          if (stringDecoder_) {
+            stringDecoder_->reset(pageData_, pageData_ + encodedDataSize_);
+          } else {
+            stringDecoder_ = std::make_unique<StringDecoder>(
+                pageData_, pageData_ + encodedDataSize_);
+          }
           break;
         case thrift::Type::FIXED_LEN_BYTE_ARRAY:
           if (type_->type()->isVarbinary() || type_->type()->isVarchar()) {
-            stringDecoder_ = std::make_unique<StringDecoder>(
-                pageData_, pageData_ + encodedDataSize_, type_->typeLength_);
+            if (stringDecoder_) {
+              stringDecoder_->reset(
+                  pageData_,
+                  pageData_ + encodedDataSize_,
+                  type_->typeLength_);
+            } else {
+              stringDecoder_ = std::make_unique<StringDecoder>(
+                  pageData_, pageData_ + encodedDataSize_, type_->typeLength_);
+            }
           } else {
             directDecoder_ =
                 std::make_unique<dwio::common::DirectDecoder<true>>(
@@ -880,7 +900,11 @@ void PageReader::makeDecoder() {
       switch (parquetType) {
         case thrift::Type::INT32:
         case thrift::Type::INT64:
-          deltaBpDecoder_ = std::make_unique<DeltaBpDecoder>(pageData_);
+          if (deltaBpDecoder_) {
+            deltaBpDecoder_->reset(pageData_);
+          } else {
+            deltaBpDecoder_ = std::make_unique<DeltaBpDecoder>(pageData_);
+          }
           break;
         default:
           VELOX_UNSUPPORTED(
