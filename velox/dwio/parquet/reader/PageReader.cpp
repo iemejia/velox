@@ -127,24 +127,25 @@ void PageReader::updateBufferPointersAfterDeserialization(
 }
 
 const char* PageReader::readBytes(int32_t size, BufferPtr& copy) {
+  if (bufferEnd_ == bufferStart_) {
+    const void* buffer = nullptr;
+    int32_t bufferSize = 0;
+    if (!inputStream_->Next(&buffer, &bufferSize)) {
+      VELOX_FAIL("Read past end");
+    }
+    bufferStart_ = reinterpret_cast<const char*>(buffer);
+    bufferEnd_ = bufferStart_ + bufferSize;
+  }
+  // Zero-copy fast path: return directly from the stream buffer when it has
+  // enough data plus SIMD padding. No timer overhead on this hot path.
+  if (bufferEnd_ - bufferStart_ >= size + kPageReadPadding) {
+    bufferStart_ += size;
+    return bufferStart_ - size;
+  }
+  // Slow path: data spans stream buffer boundaries, must copy.
   uint64_t readUs{0};
   {
     MicrosecondWallTimer timer(&readUs);
-    if (bufferEnd_ == bufferStart_) {
-      const void* buffer = nullptr;
-      int32_t bufferSize = 0;
-      if (!inputStream_->Next(&buffer, &bufferSize)) {
-        VELOX_FAIL("Read past end");
-      }
-      bufferStart_ = reinterpret_cast<const char*>(buffer);
-      bufferEnd_ = bufferStart_ + bufferSize;
-    }
-    // Fall through to the AlignedBuffer copy when the stream buffer does
-    // not have kPageReadPadding trailing bytes past 'size'.
-    if (bufferEnd_ - bufferStart_ >= size + kPageReadPadding) {
-      bufferStart_ += size;
-      return bufferStart_ - size;
-    }
     dwio::common::ensureCapacity<char>(copy, size, &pool_);
     dwio::common::readBytes(
         size,
