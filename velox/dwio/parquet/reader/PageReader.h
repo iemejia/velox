@@ -300,7 +300,10 @@ class PageReader {
     if (nulls) {
       nullsFromFastPath = dwio::common::useFastPath<Visitor, true>(visitor) &&
           (!this->type_->type()->isLongDecimal()) &&
-          (this->type_->type()->isShortDecimal() ? isDictionary() : true);
+          (this->type_->type()->isShortDecimal()
+               ? (isDictionary() ||
+                  type_->parquetType_ == thrift::Type::INT64)
+               : true);
 
       if (isDictionary()) {
         auto dictVisitor = visitor.toDictionaryColumnVisitor();
@@ -320,7 +323,10 @@ class PageReader {
         deltaBpDecoder_->readWithVisitor<false>(nulls, visitor);
       } else {
         directDecoder_->readWithVisitor<false>(
-            nulls, visitor, !this->type_->type()->isShortDecimal());
+            nulls,
+            visitor,
+            !(this->type_->type()->isShortDecimal() &&
+              type_->parquetType_ != thrift::Type::INT64));
       }
     }
   }
