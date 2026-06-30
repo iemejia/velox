@@ -327,6 +327,71 @@ BENCHMARK(AllPassthrough_10Cols) {
   benchAllPassthroughColumns(10);
 }
 
+BENCHMARK_DRAW_LINE();
+
+// -- Multi-batch benchmarks for schema caching --
+// These write many small batches to the same file.  Without schema caching,
+// each batch re-exports, re-imports, and re-walks the Arrow schema.  With
+// caching, only the first batch pays that cost.
+
+/// Writes numBatches batches of batchSize rows each to a single file.
+void writeParquetMultiBatch(
+    const RowVectorPtr& batch,
+    int numBatches,
+    memory::MemoryPool* rootPool) {
+  auto leafPool = rootPool->addLeafChild("sink");
+  auto sink = std::make_unique<MemorySink>(
+      kSinkSize, FileSink::Options{.pool = leafPool.get()});
+  WriterOptions options;
+  options.memoryPool = rootPool;
+  options.formatSpecificOptions = std::make_shared<ParquetWriterOptions>();
+  auto writer = std::make_unique<parquet::Writer>(
+      std::move(sink), options, asRowType(batch->type()));
+  for (int i = 0; i < numBatches; ++i) {
+    writer->write(batch);
+  }
+  writer->close();
+}
+
+void benchMultiBatch(int numCols, int numBatches) {
+  folly::BenchmarkSuspender suspender;
+  auto leafPool = rootPool->addLeafChild("bench");
+
+  std::vector<VectorPtr> columns;
+  std::vector<std::string> names;
+  std::vector<TypePtr> types;
+  constexpr vector_size_t kBatchSize = 10'000;
+
+  for (int i = 0; i < numCols; ++i) {
+    columns.push_back(makeDictVarchar(kBatchSize, 10, leafPool.get()));
+    names.push_back(fmt::format("c{}", i));
+    types.push_back(VARCHAR());
+  }
+
+  auto batch = std::make_shared<RowVector>(
+      leafPool.get(),
+      ROW(std::move(names), std::move(types)),
+      BufferPtr(nullptr),
+      kBatchSize,
+      std::move(columns));
+
+  suspender.dismiss();
+  writeParquetMultiBatch(batch, numBatches, rootPool.get());
+}
+
+BENCHMARK(MultiBatch_5Cols_50Batches) {
+  benchMultiBatch(5, 50);
+}
+BENCHMARK(MultiBatch_10Cols_50Batches) {
+  benchMultiBatch(10, 50);
+}
+BENCHMARK(MultiBatch_20Cols_50Batches) {
+  benchMultiBatch(20, 50);
+}
+BENCHMARK(MultiBatch_10Cols_200Batches) {
+  benchMultiBatch(10, 200);
+}
+
 } // namespace
 
 int32_t main(int32_t argc, char* argv[]) {
