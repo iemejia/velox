@@ -394,6 +394,59 @@ BENCHMARK(Parallel_20Cols_Zstd) {
 
 BENCHMARK_DRAW_LINE();
 
+// -- Flush estimation benchmarks --
+// These write many batches of dictionary data with a size-based flush policy.
+// With accurate size estimation, fewer row groups are created, meaning less
+// flush overhead and better compression.
+
+void benchFlushEstimation(int numBatches) {
+  folly::BenchmarkSuspender suspender;
+  auto leafPool = rootPool->addLeafChild("bench");
+  constexpr vector_size_t kBatchSize = 10'000;
+  constexpr int kDictSize = 10;
+
+  // Each batch: 10K rows of dict VARCHAR (retained ~40KB, flat estimate ~600KB)
+  auto dict = makeDictVarchar(kBatchSize, kDictSize, leafPool.get());
+  auto batch = std::make_shared<RowVector>(
+      leafPool.get(),
+      ROW({"c0"}, {VARCHAR()}),
+      BufferPtr(nullptr),
+      kBatchSize,
+      std::vector<VectorPtr>{dict});
+
+  suspender.dismiss();
+
+  auto sinkPool = rootPool->addLeafChild("sink");
+  auto sink = std::make_unique<MemorySink>(
+      kSinkSize, FileSink::Options{.pool = sinkPool.get()});
+  WriterOptions options;
+  options.memoryPool = rootPool.get();
+  // 512KB byte threshold — with flat estimate each 10K batch looks like
+  // ~600KB (exceeds threshold every batch). With retained size each batch
+  // is ~40KB so ~12 batches fit per row group.
+  options.flushPolicyFactory = []() {
+    return std::make_unique<DefaultFlushPolicy>(
+        /*rowsInRowGroup=*/1'000'000,
+        /*bytesInRowGroup=*/512 * 1'024);
+  };
+  options.formatSpecificOptions = std::make_shared<ParquetWriterOptions>();
+  auto writer = std::make_unique<parquet::Writer>(
+      std::move(sink), options, asRowType(batch->type()));
+  for (int i = 0; i < numBatches; ++i) {
+    writer->write(batch);
+  }
+  writer->close();
+}
+
+BENCHMARK(FlushEstimation_50Batches) {
+  benchFlushEstimation(50);
+}
+BENCHMARK(FlushEstimation_200Batches) {
+  benchFlushEstimation(200);
+}
+
+BENCHMARK_DRAW_LINE();
+
 // -- Multi-batch benchmarks for schema caching --
 // These write many small batches to the same file.  Without schema caching,
 // each batch re-exports, re-imports, and re-walks the Arrow schema.  With

@@ -511,7 +511,13 @@ void Writer::write(const VectorPtr& data) {
       auto recordBatch,
       ::arrow::ImportRecordBatch(&array, arrowContext_->schema));
 
-  auto bytes = data->estimateFlatSize();
+  // Use retainedSize() rather than estimateFlatSize() for the flush policy
+  // size estimate. estimateFlatSize() computes the fully materialized size of
+  // dictionary columns (rows * avgValueSize), which greatly overestimates the
+  // actual data written when dictionaries pass through without flattening.
+  // retainedSize() reports the actual memory footprint (dictionary values +
+  // index buffer), matching what is encoded in the Parquet file.
+  auto bytes = data->retainedSize();
   auto numRows = data->size();
 
   // Check flush policy before writing. Flush closes the current buffered
