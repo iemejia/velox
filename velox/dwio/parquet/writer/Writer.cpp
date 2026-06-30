@@ -109,8 +109,10 @@ struct ArrowContext {
   std::shared_ptr<WriterProperties> properties;
   uint64_t stagingRows = 0;
   int64_t stagingBytes = 0;
-  // columns, Arrays
-  std::vector<std::vector<std::shared_ptr<::arrow::Array>>> stagingChunks;
+
+  /// Set by flush() to force writeRecordBatch to start a new row group on the
+  /// next write.
+  bool forceNewRowGroup = false;
 };
 
 Compression::type getArrowParquetCompression(
@@ -446,42 +448,9 @@ Writer::Writer(
 
 void Writer::flush() {
   if (arrowContext_->stagingRows > 0) {
-    if (!arrowContext_->writer) {
-      ArrowWriterProperties::Builder builder;
-      if (writeInt96AsTimestamp_) {
-        builder.enableDeprecatedInt96Timestamps();
-      }
-      auto arrowProperties = builder.build();
-      PARQUET_ASSIGN_OR_THROW(
-          arrowContext_->writer,
-          FileWriter::open(
-              *arrowContext_->schema.get(),
-              arrowMemoryPool_.get(),
-              stream_,
-              arrowContext_->properties,
-              arrowProperties));
-    }
-
-    auto fields = arrowContext_->schema->fields();
-    std::vector<std::shared_ptr<::arrow::ChunkedArray>> chunks;
-    for (int colIdx = 0; colIdx < fields.size(); colIdx++) {
-      auto dataType = fields.at(colIdx)->type();
-      auto chunk =
-          ::arrow::ChunkedArray::Make(
-              std::move(arrowContext_->stagingChunks.at(colIdx)), dataType)
-              .ValueOrDie();
-      chunks.push_back(chunk);
-    }
-    auto table = ::arrow::Table::Make(
-        arrowContext_->schema,
-        std::move(chunks),
-        static_cast<int64_t>(arrowContext_->stagingRows));
-    PARQUET_THROW_NOT_OK(arrowContext_->writer->writeTable(
-        *table, static_cast<int64_t>(flushPolicy_->rowsInRowGroup())));
+    // Signal that the next writeRecordBatch should start a fresh row group.
+    arrowContext_->forceNewRowGroup = true;
     PARQUET_THROW_NOT_OK(stream_->Flush());
-    for (auto& chunk : arrowContext_->stagingChunks) {
-      chunk.clear();
-    }
     arrowContext_->stagingRows = 0;
     arrowContext_->stagingBytes = 0;
   }
@@ -534,11 +503,6 @@ void Writer::write(const VectorPtr& data) {
     }
 
     arrowContext_->schema = ::arrow::schema(newFields);
-    for (int colIdx = 0; colIdx < arrowContext_->schema->num_fields();
-         colIdx++) {
-      arrowContext_->stagingChunks.push_back(
-          std::vector<std::shared_ptr<::arrow::Array>>());
-    }
   }
 
   // Import the data array using the cached schema.
@@ -548,15 +512,42 @@ void Writer::write(const VectorPtr& data) {
 
   auto bytes = data->estimateFlatSize();
   auto numRows = data->size();
+
+  // Check flush policy before writing. Flush closes the current buffered
+  // row group so the next writeRecordBatch starts a new one.
   if (flushPolicy_->shouldFlush(getStripeProgress(
           arrowContext_->stagingRows, arrowContext_->stagingBytes))) {
     flush();
   }
 
-  for (int colIdx = 0; colIdx < recordBatch->num_columns(); colIdx++) {
-    arrowContext_->stagingChunks.at(colIdx).push_back(
-        recordBatch->column(colIdx));
+  // Lazily open the FileWriter on the first batch that has data.
+  if (!arrowContext_->writer) {
+    ArrowWriterProperties::Builder builder;
+    if (writeInt96AsTimestamp_) {
+      builder.enableDeprecatedInt96Timestamps();
+    }
+    auto arrowProperties = builder.build();
+    PARQUET_ASSIGN_OR_THROW(
+        arrowContext_->writer,
+        FileWriter::open(
+            *arrowContext_->schema.get(),
+            arrowMemoryPool_.get(),
+            stream_,
+            arrowContext_->properties,
+            arrowProperties));
   }
+
+  // If flush() was called since the last write, force a new row group so
+  // data written before and after the flush end up in separate groups.
+  if (arrowContext_->forceNewRowGroup) {
+    PARQUET_THROW_NOT_OK(arrowContext_->writer->newBufferedRowGroup());
+    arrowContext_->forceNewRowGroup = false;
+  }
+
+  // Write the batch directly. The Arrow writer manages buffered row groups
+  // and splits them when maxRowGroupLength is reached.
+  PARQUET_THROW_NOT_OK(arrowContext_->writer->writeRecordBatch(*recordBatch));
+
   arrowContext_->stagingRows += numRows;
   arrowContext_->stagingBytes += bytes;
 }
@@ -582,8 +573,6 @@ std::unique_ptr<dwio::common::FileMetadata> Writer::close() {
   }
 
   PARQUET_THROW_NOT_OK(stream_->Close());
-
-  arrowContext_->stagingChunks.clear();
 
   return parquetFileMetadata;
 }
