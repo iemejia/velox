@@ -208,6 +208,125 @@ BENCHMARK(FlatInteger) {
   writeParquet(data, rootPool.get());
 }
 
+BENCHMARK_DRAW_LINE();
+
+// -- Multi-column benchmarks for selective flattening --
+// These test the case where one column forces flattening (dict-of-dict) while
+// other columns are passthrough dictionaries.  With blanket flattening, all
+// columns get materialized.  With selective flattening, only the one that
+// needs it is flattened.
+
+/// Builds a dict-of-dict INTEGER column (forces flattening in needFlatten).
+VectorPtr makeDictOfDictInteger(
+    vector_size_t numRows,
+    int dictSize,
+    memory::MemoryPool* pool) {
+  auto dictionary = BaseVector::create(INTEGER(), dictSize, pool);
+  auto* flat = dictionary->asFlatVector<int32_t>();
+  for (int i = 0; i < dictSize; ++i) {
+    flat->set(i, i * 13);
+  }
+
+  BufferPtr innerIdx = AlignedBuffer::allocate<vector_size_t>(numRows, pool);
+  auto rawInner = innerIdx->asMutable<vector_size_t>();
+  for (vector_size_t i = 0; i < numRows; ++i) {
+    rawInner[i] = i % dictSize;
+  }
+  auto innerDict = BaseVector::wrapInDictionary(
+      BufferPtr(nullptr), innerIdx, numRows, dictionary);
+
+  BufferPtr outerIdx = AlignedBuffer::allocate<vector_size_t>(numRows, pool);
+  auto rawOuter = outerIdx->asMutable<vector_size_t>();
+  for (vector_size_t i = 0; i < numRows; ++i) {
+    rawOuter[i] = i;
+  }
+  return BaseVector::wrapInDictionary(
+      BufferPtr(nullptr), outerIdx, numRows, innerDict);
+}
+
+/// N passthrough dict VARCHAR columns + 1 dict-of-dict column that forces
+/// flattening.  With blanket flattening all N+1 columns are flattened; with
+/// selective flattening only the dict-of-dict column is.
+void benchMixedColumns(int numPassthroughCols) {
+  folly::BenchmarkSuspender suspender;
+  auto leafPool = rootPool->addLeafChild("bench");
+
+  std::vector<VectorPtr> columns;
+  std::vector<std::string> names;
+  std::vector<TypePtr> types;
+
+  // Passthrough dict VARCHAR columns (low cardinality).
+  for (int i = 0; i < numPassthroughCols; ++i) {
+    columns.push_back(makeDictVarchar(kNumRows, 10, leafPool.get()));
+    names.push_back(fmt::format("dict_{}", i));
+    types.push_back(VARCHAR());
+  }
+
+  // One dict-of-dict INTEGER column that forces flattening.
+  columns.push_back(makeDictOfDictInteger(kNumRows, 50, leafPool.get()));
+  names.push_back("nested");
+  types.push_back(INTEGER());
+
+  auto data = std::make_shared<RowVector>(
+      leafPool.get(),
+      ROW(std::move(names), std::move(types)),
+      BufferPtr(nullptr),
+      kNumRows,
+      std::move(columns));
+
+  suspender.dismiss();
+  writeParquet(data, rootPool.get());
+}
+
+BENCHMARK(Mixed_1DictPassthrough_1Nested) {
+  benchMixedColumns(1);
+}
+BENCHMARK(Mixed_5DictPassthrough_1Nested) {
+  benchMixedColumns(5);
+}
+BENCHMARK(Mixed_10DictPassthrough_1Nested) {
+  benchMixedColumns(10);
+}
+BENCHMARK(Mixed_20DictPassthrough_1Nested) {
+  benchMixedColumns(20);
+}
+
+BENCHMARK_DRAW_LINE();
+
+/// Control: N passthrough dict VARCHAR columns with NO column that forces
+/// flattening.  Should show no difference between blanket and selective.
+void benchAllPassthroughColumns(int numCols) {
+  folly::BenchmarkSuspender suspender;
+  auto leafPool = rootPool->addLeafChild("bench");
+
+  std::vector<VectorPtr> columns;
+  std::vector<std::string> names;
+  std::vector<TypePtr> types;
+
+  for (int i = 0; i < numCols; ++i) {
+    columns.push_back(makeDictVarchar(kNumRows, 10, leafPool.get()));
+    names.push_back(fmt::format("c{}", i));
+    types.push_back(VARCHAR());
+  }
+
+  auto data = std::make_shared<RowVector>(
+      leafPool.get(),
+      ROW(std::move(names), std::move(types)),
+      BufferPtr(nullptr),
+      kNumRows,
+      std::move(columns));
+
+  suspender.dismiss();
+  writeParquet(data, rootPool.get());
+}
+
+BENCHMARK(AllPassthrough_5Cols) {
+  benchAllPassthroughColumns(5);
+}
+BENCHMARK(AllPassthrough_10Cols) {
+  benchAllPassthroughColumns(10);
+}
+
 } // namespace
 
 int32_t main(int32_t argc, char* argv[]) {
