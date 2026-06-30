@@ -496,8 +496,9 @@ class FileWriterImpl : public FileWriter {
       RETURN_NOT_OK(writeBatch(offset, batchSize));
       offset += batchSize;
 
-      // Flush current row group if it is full.
-      if (rowGroupWriter_->numRows() >= maxRowGroupLength) {
+      // Flush current row group if it is full and there is more data to write.
+      if (rowGroupWriter_->numRows() >= maxRowGroupLength &&
+          offset < batch.num_rows()) {
         RETURN_NOT_OK(newBufferedRowGroup());
       }
     }
