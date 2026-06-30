@@ -329,6 +329,71 @@ BENCHMARK(AllPassthrough_10Cols) {
 
 BENCHMARK_DRAW_LINE();
 
+// -- Parallel column writing benchmarks --
+// Compare serial vs parallel writing with ZSTD compression.
+
+void writeParquetWithOptions(
+    const RowVectorPtr& data,
+    memory::MemoryPool* rootPool,
+    bool parallel,
+    common::CompressionKind compression) {
+  auto leafPool = rootPool->addLeafChild("sink");
+  auto sink = std::make_unique<MemorySink>(
+      kSinkSize, FileSink::Options{.pool = leafPool.get()});
+  WriterOptions options;
+  options.memoryPool = rootPool;
+  options.compressionKind = compression;
+  auto parquetOpts = std::make_shared<ParquetWriterOptions>();
+  parquetOpts->enableParallelWrite = parallel;
+  options.formatSpecificOptions = parquetOpts;
+  auto writer = std::make_unique<parquet::Writer>(
+      std::move(sink), options, asRowType(data->type()));
+  writer->write(data);
+  writer->close();
+}
+
+void benchParallelWrite(int numCols, bool parallel) {
+  folly::BenchmarkSuspender suspender;
+  auto leafPool = rootPool->addLeafChild("bench");
+  constexpr vector_size_t kParBatchSize = 100'000;
+
+  std::vector<VectorPtr> columns;
+  std::vector<std::string> names;
+  std::vector<TypePtr> types;
+
+  for (int i = 0; i < numCols; ++i) {
+    columns.push_back(makeDictVarchar(kParBatchSize, 100, leafPool.get()));
+    names.push_back(fmt::format("c{}", i));
+    types.push_back(VARCHAR());
+  }
+
+  auto data = std::make_shared<RowVector>(
+      leafPool.get(),
+      ROW(std::move(names), std::move(types)),
+      BufferPtr(nullptr),
+      kParBatchSize,
+      std::move(columns));
+
+  suspender.dismiss();
+  writeParquetWithOptions(
+      data, rootPool.get(), parallel, common::CompressionKind_ZSTD);
+}
+
+BENCHMARK(Serial_10Cols_Zstd) {
+  benchParallelWrite(10, false);
+}
+BENCHMARK(Parallel_10Cols_Zstd) {
+  benchParallelWrite(10, true);
+}
+BENCHMARK(Serial_20Cols_Zstd) {
+  benchParallelWrite(20, false);
+}
+BENCHMARK(Parallel_20Cols_Zstd) {
+  benchParallelWrite(20, true);
+}
+
+BENCHMARK_DRAW_LINE();
+
 // -- Multi-batch benchmarks for schema caching --
 // These write many small batches to the same file.  Without schema caching,
 // each batch re-exports, re-imports, and re-walks the Arrow schema.  With
