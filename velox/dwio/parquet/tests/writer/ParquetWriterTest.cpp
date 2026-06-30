@@ -1817,6 +1817,78 @@ TEST_F(ParquetWriterTest, allNulls) {
   assertReadWithReaderAndExpected(schema, *rowReader, data, *leafPool_);
 }
 
+/// Verifies that the flush policy uses actual retained size, not flat estimate,
+/// for dictionary columns. With estimateFlatSize() the 100K-row dictionary
+/// column would appear to be ~6MB (100K * 60-byte strings), exceeding a 2MB
+/// bytesInRowGroup threshold and causing multiple row groups. With
+/// retainedSize() the actual footprint is ~500KB (dictionary + indices),
+/// fitting in a single row group.
+TEST_F(ParquetWriterTest, flushEstimationDictionaryAware) {
+  constexpr vector_size_t kSize = 100'000;
+  constexpr int kDictSize = 10;
+
+  std::vector<std::string> dictStrings(kDictSize);
+  for (int i = 0; i < kDictSize; ++i) {
+    dictStrings[i] =
+        fmt::format("this_is_a_longer_dictionary_value_for_testing_{:04d}", i);
+  }
+  auto dictionary = makeFlatVector<StringView>(
+      kDictSize, [&](auto row) { return StringView(dictStrings[row]); });
+
+  BufferPtr indices =
+      AlignedBuffer::allocate<vector_size_t>(kSize, leafPool_.get());
+  auto rawIndices = indices->asMutable<vector_size_t>();
+  for (vector_size_t i = 0; i < kSize; ++i) {
+    rawIndices[i] = i % kDictSize;
+  }
+  auto dictVector = BaseVector::wrapInDictionary(
+      BufferPtr(nullptr), indices, kSize, dictionary);
+
+  auto data = makeRowVector({dictVector});
+  auto schema = asRowType(data->type());
+
+  dwio::common::WriterOptions options;
+  options.memoryPool = rootPool_.get();
+  options.flushPolicyFactory = []() {
+    return std::make_unique<DefaultFlushPolicy>(
+        /*rowsInRowGroup=*/1'000'000,
+        /*bytesInRowGroup=*/2 * 1'024 * 1'024);
+  };
+  auto* sinkPtr = write(data, options, ParquetWriterOptions{});
+
+  auto reader = createReaderInMemory(*sinkPtr);
+  ASSERT_EQ(reader->numberOfRows(), kSize);
+  // Should be a single row group because the actual data size is well under
+  // the 2MB threshold.
+  ASSERT_EQ(reader->fileMetaData().numRowGroups(), 1);
+}
+
+/// Verifies that flat columns still trigger flush at the correct threshold.
+TEST_F(ParquetWriterTest, flushEstimationFlatColumns) {
+  constexpr vector_size_t kBatchSize = 50'000;
+
+  auto batch = makeRowVector({
+      makeFlatVector<int32_t>(kBatchSize, [](auto row) { return row; }),
+      makeFlatVector<int64_t>(
+          kBatchSize, [](auto row) { return static_cast<int64_t>(row); }),
+  });
+
+  ParquetWriterOptions writerOptions;
+  dwio::common::WriterOptions options;
+  options.memoryPool = rootPool_.get();
+  options.flushPolicyFactory = []() {
+    return std::make_unique<DefaultFlushPolicy>(
+        /*rowsInRowGroup=*/1'000'000,
+        /*bytesInRowGroup=*/500 * 1'024);
+  };
+
+  auto* sinkPtr = write(batch, options, writerOptions);
+  // First batch is ~600KB, exceeds 500KB threshold on second write.
+
+  auto reader = createReaderInMemory(*sinkPtr);
+  ASSERT_EQ(reader->numberOfRows(), kBatchSize);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {

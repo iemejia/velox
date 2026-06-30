@@ -327,6 +327,54 @@ BENCHMARK(AllPassthrough_10Cols) {
   benchAllPassthroughColumns(10);
 }
 
+BENCHMARK_DRAW_LINE();
+
+// -- Flush estimation benchmarks --
+
+void benchFlushEstimation(int numBatches) {
+  folly::BenchmarkSuspender suspender;
+  auto leafPool = rootPool->addLeafChild("bench");
+  constexpr vector_size_t kBatchSize = 10'000;
+  constexpr int kDictSize = 10;
+
+  auto dict = makeDictVarchar(kBatchSize, kDictSize, leafPool.get());
+  auto batch = std::make_shared<RowVector>(
+      leafPool.get(),
+      ROW({"c0"}, {VARCHAR()}),
+      BufferPtr(nullptr),
+      kBatchSize,
+      std::vector<VectorPtr>{dict});
+
+  suspender.dismiss();
+
+  auto sinkPool = rootPool->addLeafChild("sink");
+  for (int iter = 0; iter < kNumIterations; ++iter) {
+    auto sink = std::make_unique<MemorySink>(
+        kSinkSize, FileSink::Options{.pool = sinkPool.get()});
+    WriterOptions options;
+    options.memoryPool = rootPool.get();
+    options.flushPolicyFactory = []() {
+      return std::make_unique<DefaultFlushPolicy>(
+          /*rowsInRowGroup=*/1'000'000,
+          /*bytesInRowGroup=*/512 * 1'024);
+    };
+    options.formatSpecificOptions = std::make_shared<ParquetWriterOptions>();
+    auto writer = std::make_unique<parquet::Writer>(
+        std::move(sink), options, asRowType(batch->type()));
+    for (int i = 0; i < numBatches; ++i) {
+      writer->write(batch);
+    }
+    writer->close();
+  }
+}
+
+BENCHMARK(FlushEstimation_50Batches) {
+  benchFlushEstimation(50);
+}
+BENCHMARK(FlushEstimation_200Batches) {
+  benchFlushEstimation(200);
+}
+
 } // namespace
 
 int32_t main(int32_t argc, char* argv[]) {
