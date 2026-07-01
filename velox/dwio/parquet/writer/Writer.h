@@ -198,17 +198,22 @@ class Writer : public dwio::common::Writer {
   // Sets the memory reclaimers for all the memory pools used by this writer.
   void setMemoryReclaimers();
 
-  // Checks if the input data requires flattening before Arrow export.
-  // Returns true for:
+  // Prepares input data for Arrow export by selectively transforming columns:
+  //
+  // Full flatten (materialization) for:
   //  - Dictionary wrapping a complex (non-primitive) type.
   //  - Dictionary wrapping a non-flat inner vector (e.g., dict-of-dict).
+  //  - Dictionary whose values vector contains nulls (Arrow limitation).
   //  - Constant wrapping a non-flat inner vector (e.g., constant-of-dict).
-  // Returns false for scalar dictionary vectors (passthrough to Arrow Parquet
-  // writer) and flat complex types (handled natively by the Arrow bridge).
   //
-  // When flattening is needed, only the columns that require it are flattened.
-  // Columns that can be passed through (e.g., scalar dictionaries) are left
-  // unchanged, avoiding unnecessary materialization.
+  // Indices detach (copy only the indices buffer) for:
+  //  - Scalar dictionary vectors eligible for passthrough. This prevents
+  //    external owners (e.g., FileDataSink's partitionRows_) from corrupting
+  //    staged Arrow data by overwriting the shared indices buffer on
+  //    subsequent batches.
+  //
+  // Pass-through (no copy) for:
+  //  - Flat vectors and flat complex types.
   VectorPtr flattenIfNeeded(const VectorPtr& data) const;
 
   // Pool for 'stream_'.

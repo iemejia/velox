@@ -17,6 +17,7 @@
 #include "velox/dwio/parquet/writer/Writer.h"
 
 #include <algorithm>
+#include <cstring>
 #include <exception>
 
 #include <arrow/c/bridge.h>
@@ -635,6 +636,32 @@ bool childNeedsFlatten(const VectorPtr& child) {
       if (!innerVector->isFlatEncoding()) {
         return true;
       }
+      // Flatten if the dictionary values contain nulls. Arrow's Parquet
+      // writer does not support DictionaryArray with nulls encoded in the
+      // dictionary values — nulls must be represented in the indices layer.
+      if (innerVector->mayHaveNulls()) {
+        return true;
+      }
+      // Flatten "selection dictionaries" where the dictionary is larger than
+      // the vector (e.g., exec::wrap selecting a partition's rows from a full
+      // batch). Passing these through to Arrow is counterproductive: Arrow's
+      // putDictionary hashes all dictionary entries, detects duplicates, and
+      // falls back to plain encoding — wasting work. Flattening up front is
+      // cheaper because it only materializes the selected rows.
+      //
+      // Also flatten when the dictionary exceeds kMaxPassthroughDictSize.
+      // Arrow's putDictionary inserts each entry individually into its memo
+      // table, while its flat-data batch path uses more efficient vectorized
+      // encoding. Benchmarks show the crossover at ~1000-10000 entries;
+      // 4096 sits in the neutral zone. Note that Parquet/Spark/Arrow all use
+      // a 1MB *byte-size* limit for their own dictionary encoding decisions,
+      // but that governs Parquet-level encoding, not the Velox-to-Arrow
+      // handoff efficiency that this threshold addresses.
+      constexpr vector_size_t kMaxPassthroughDictSize = 4'096;
+      if (innerVector->size() > child->size() ||
+          innerVector->size() > kMaxPassthroughDictSize) {
+        return true;
+      }
     }
   } else if (encoding == VectorEncoding::Simple::CONSTANT) {
     // Flatten constant wrapping a non-flat inner vector
@@ -646,6 +673,18 @@ bool childNeedsFlatten(const VectorPtr& child) {
   return false;
 }
 
+/// Returns true if a dictionary child should have its indices detached (copied)
+/// before Arrow export. This is needed because the Arrow bridge stores a
+/// shared reference to the indices buffer; if an external owner (e.g.,
+/// FileDataSink's partitionRows_) later overwrites that buffer for a
+/// subsequent batch, the staged Arrow array would be silently corrupted.
+/// Copying just the indices (N * sizeof(int32_t)) is cheap compared to a
+/// full flatten that materializes the dictionary values.
+bool childNeedsDetach(const VectorPtr& child) {
+  return child->encoding() == VectorEncoding::Simple::DICTIONARY &&
+      !childNeedsFlatten(child);
+}
+
 } // namespace
 
 VectorPtr Writer::flattenIfNeeded(const VectorPtr& data) const {
@@ -654,24 +693,38 @@ VectorPtr Writer::flattenIfNeeded(const VectorPtr& data) const {
       rowVector, "Arrow export expects a RowVector as input data.");
 
   const auto& children = rowVector->children();
-  bool anyNeedsFlatten = false;
+  bool anyNeedsWork = false;
   for (const auto& child : children) {
-    if (childNeedsFlatten(child)) {
-      anyNeedsFlatten = true;
+    if (childNeedsFlatten(child) || childNeedsDetach(child)) {
+      anyNeedsWork = true;
       break;
     }
   }
 
-  if (!anyNeedsFlatten) {
+  if (!anyNeedsWork) {
     return data;
   }
 
-  // Selectively flatten only the columns that need it.
+  // Selectively flatten or detach only the columns that need it.
   std::vector<VectorPtr> newChildren(children.size());
   for (size_t i = 0; i < children.size(); ++i) {
     if (childNeedsFlatten(children[i])) {
       newChildren[i] = children[i];
       BaseVector::flattenVector(newChildren[i]);
+    } else if (childNeedsDetach(children[i])) {
+      // Copy only the indices buffer to prevent external mutation from
+      // corrupting staged Arrow data. The dictionary values are shared
+      // (zero-copy) since they are immutable string data.
+      const auto& dict = children[i];
+      auto srcIndices = dict->wrapInfo();
+      const auto numBytes = dict->size() * sizeof(vector_size_t);
+      auto newIndices =
+          AlignedBuffer::allocate<vector_size_t>(dict->size(), generalPool_.get());
+      std::memcpy(
+          newIndices->asMutable<char>(), srcIndices->as<char>(), numBytes);
+      newChildren[i] = BaseVector::wrapInDictionary(
+          dict->nulls(), std::move(newIndices), dict->size(),
+          dict->valueVector());
     } else {
       newChildren[i] = children[i];
     }

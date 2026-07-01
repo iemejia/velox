@@ -329,6 +329,283 @@ BENCHMARK(AllPassthrough_10Cols) {
 
 BENCHMARK_DRAW_LINE();
 
+// -- Null handling benchmarks --
+// These measure the cost of the indices detach (null at wrapping layer) vs
+// full flattening (null in dictionary values) vs no-null passthrough.
+
+/// Dictionary with nulls at the WRAPPING layer (indices null bitmap set).
+/// This follows the detach path: indices are copied, dictionary values shared.
+VectorPtr makeDictVarcharWithNullIndices(
+    vector_size_t numRows,
+    int dictSize,
+    double nullRatio,
+    memory::MemoryPool* pool) {
+  auto strings = std::make_shared<std::vector<std::string>>(dictSize);
+  for (int i = 0; i < dictSize; ++i) {
+    (*strings)[i] = fmt::format("value_{:06d}", i);
+  }
+
+  auto dictionary = BaseVector::create(VARCHAR(), dictSize, pool);
+  auto* flat = dictionary->asFlatVector<StringView>();
+  for (int i = 0; i < dictSize; ++i) {
+    flat->set(i, StringView((*strings)[i]));
+  }
+
+  BufferPtr indices = AlignedBuffer::allocate<vector_size_t>(numRows, pool);
+  auto rawIndices = indices->asMutable<vector_size_t>();
+  for (vector_size_t i = 0; i < numRows; ++i) {
+    rawIndices[i] = i % dictSize;
+  }
+
+  // Create null bitmap at the wrapping layer.
+  BufferPtr nulls = AlignedBuffer::allocate<bool>(numRows, pool);
+  auto rawNulls = nulls->asMutable<uint64_t>();
+  for (vector_size_t i = 0; i < numRows; ++i) {
+    bits::setNull(rawNulls, i, (i % 100) < static_cast<int>(nullRatio * 100));
+  }
+
+  return BaseVector::wrapInDictionary(nulls, indices, numRows, dictionary);
+}
+
+/// Dictionary whose VALUES array contains nulls. This triggers full flattening
+/// because Arrow does not support DictionaryArray with nulls in the dictionary.
+VectorPtr makeDictVarcharWithNullValues(
+    vector_size_t numRows,
+    int dictSize,
+    double nullRatio,
+    memory::MemoryPool* pool) {
+  auto strings = std::make_shared<std::vector<std::string>>(dictSize);
+  for (int i = 0; i < dictSize; ++i) {
+    (*strings)[i] = fmt::format("value_{:06d}", i);
+  }
+
+  auto dictionary = BaseVector::create(VARCHAR(), dictSize, pool);
+  auto* flat = dictionary->asFlatVector<StringView>();
+  for (int i = 0; i < dictSize; ++i) {
+    if ((i % static_cast<int>(1.0 / nullRatio)) == 0) {
+      flat->setNull(i, true);
+    } else {
+      flat->set(i, StringView((*strings)[i]));
+    }
+  }
+
+  BufferPtr indices = AlignedBuffer::allocate<vector_size_t>(numRows, pool);
+  auto rawIndices = indices->asMutable<vector_size_t>();
+  for (vector_size_t i = 0; i < numRows; ++i) {
+    rawIndices[i] = i % dictSize;
+  }
+
+  return BaseVector::wrapInDictionary(
+      BufferPtr(nullptr), indices, numRows, dictionary);
+}
+
+void benchDictVarcharNullIndices(int dictSize, double nullRatio) {
+  folly::BenchmarkSuspender suspender;
+  auto leafPool = rootPool->addLeafChild("bench");
+  auto column =
+      makeDictVarcharWithNullIndices(kNumRows, dictSize, nullRatio, leafPool.get());
+  auto data = std::make_shared<RowVector>(
+      leafPool.get(),
+      ROW({"c0"}, {VARCHAR()}),
+      BufferPtr(nullptr),
+      kNumRows,
+      std::vector<VectorPtr>{column});
+  suspender.dismiss();
+  writeParquet(data, rootPool.get());
+}
+
+void benchDictVarcharNullValues(int dictSize, double nullRatio) {
+  folly::BenchmarkSuspender suspender;
+  auto leafPool = rootPool->addLeafChild("bench");
+  auto column =
+      makeDictVarcharWithNullValues(kNumRows, dictSize, nullRatio, leafPool.get());
+  auto data = std::make_shared<RowVector>(
+      leafPool.get(),
+      ROW({"c0"}, {VARCHAR()}),
+      BufferPtr(nullptr),
+      kNumRows,
+      std::vector<VectorPtr>{column});
+  suspender.dismiss();
+  writeParquet(data, rootPool.get());
+}
+
+// Null at wrapping layer: passthrough + detach (cheap memcpy of indices).
+BENCHMARK(DictVarchar_NullIndices_10pct_Card10) {
+  benchDictVarcharNullIndices(10, 0.1);
+}
+BENCHMARK(DictVarchar_NullIndices_50pct_Card10) {
+  benchDictVarcharNullIndices(10, 0.5);
+}
+BENCHMARK(DictVarchar_NullIndices_10pct_Card1000) {
+  benchDictVarcharNullIndices(1'000, 0.1);
+}
+BENCHMARK(DictVarchar_NullIndices_50pct_Card1000) {
+  benchDictVarcharNullIndices(1'000, 0.5);
+}
+
+BENCHMARK_DRAW_LINE();
+
+// Null in dictionary values: forced full flatten (expensive materialization).
+BENCHMARK(DictVarchar_NullValues_10pct_Card10) {
+  benchDictVarcharNullValues(10, 0.1);
+}
+BENCHMARK(DictVarchar_NullValues_50pct_Card10) {
+  benchDictVarcharNullValues(10, 0.5);
+}
+BENCHMARK(DictVarchar_NullValues_10pct_Card1000) {
+  benchDictVarcharNullValues(1'000, 0.1);
+}
+BENCHMARK(DictVarchar_NullValues_50pct_Card1000) {
+  benchDictVarcharNullValues(1'000, 0.5);
+}
+
+BENCHMARK_DRAW_LINE();
+
+// -- Multi-batch with shared indices (FileDataSink pattern) --
+// Measures the cost of indices detach across multiple write() calls where the
+// same buffer is reused (simulating partitioned writes).
+
+void benchMultiBatchSharedIndices(int numBatches, int dictSize) {
+  folly::BenchmarkSuspender suspender;
+  auto leafPool = rootPool->addLeafChild("bench");
+  constexpr vector_size_t kBatchSize = 10'000;
+
+  auto strings = std::make_shared<std::vector<std::string>>(dictSize);
+  for (int i = 0; i < dictSize; ++i) {
+    (*strings)[i] = fmt::format("value_{:06d}", i);
+  }
+  auto dictionary = BaseVector::create(VARCHAR(), dictSize, leafPool.get());
+  auto* flat = dictionary->asFlatVector<StringView>();
+  for (int i = 0; i < dictSize; ++i) {
+    flat->set(i, StringView((*strings)[i]));
+  }
+
+  // Shared indices buffer, overwritten each batch (like partitionRows_).
+  BufferPtr sharedIndices =
+      AlignedBuffer::allocate<vector_size_t>(kBatchSize, leafPool.get());
+
+  suspender.dismiss();
+
+  auto sinkPool = rootPool->addLeafChild("sink");
+  for (int iter = 0; iter < kNumIterations; ++iter) {
+    auto sink = std::make_unique<MemorySink>(
+        kSinkSize, FileSink::Options{.pool = sinkPool.get()});
+    WriterOptions options;
+    options.memoryPool = rootPool.get();
+    options.formatSpecificOptions = std::make_shared<ParquetWriterOptions>();
+    auto writer = std::make_unique<parquet::Writer>(
+        std::move(sink), options, ROW({"c0"}, {VARCHAR()}));
+    for (int batch = 0; batch < numBatches; ++batch) {
+      auto rawIndices = sharedIndices->asMutable<vector_size_t>();
+      for (vector_size_t i = 0; i < kBatchSize; ++i) {
+        rawIndices[i] = (i + batch * 7) % dictSize;
+      }
+      auto dictCol = BaseVector::wrapInDictionary(
+          BufferPtr(nullptr), sharedIndices, kBatchSize, dictionary);
+      auto data = std::make_shared<RowVector>(
+          leafPool.get(),
+          ROW({"c0"}, {VARCHAR()}),
+          BufferPtr(nullptr),
+          kBatchSize,
+          std::vector<VectorPtr>{dictCol});
+      writer->write(data);
+    }
+    writer->close();
+  }
+}
+
+BENCHMARK(MultiBatch_10x10K_Card10_SharedIdx) {
+  benchMultiBatchSharedIndices(10, 10);
+}
+BENCHMARK(MultiBatch_50x10K_Card10_SharedIdx) {
+  benchMultiBatchSharedIndices(50, 10);
+}
+BENCHMARK(MultiBatch_10x10K_Card1000_SharedIdx) {
+  benchMultiBatchSharedIndices(10, 1'000);
+}
+BENCHMARK(MultiBatch_50x10K_Card1000_SharedIdx) {
+  benchMultiBatchSharedIndices(50, 1'000);
+}
+
+BENCHMARK_DRAW_LINE();
+
+// -- Partition routing simulation (exec::wrap pattern) --
+// The dictionary IS the full original flat vector (with duplicates), and the
+// indices select a subset of rows. This is what FileDataSink actually produces
+// when partitioning.
+
+void benchPartitionRouting(int numPartitions, int batchSize, int numUnique) {
+  folly::BenchmarkSuspender suspender;
+  auto leafPool = rootPool->addLeafChild("bench");
+
+  // Build a flat vector representing the original batch (with duplicates).
+  auto strings = std::make_shared<std::vector<std::string>>(batchSize);
+  for (int i = 0; i < batchSize; ++i) {
+    (*strings)[i] = fmt::format("value_{:06d}", i % numUnique);
+  }
+  auto fullBatch = BaseVector::create(VARCHAR(), batchSize, leafPool.get());
+  auto* flat = fullBatch->asFlatVector<StringView>();
+  for (int i = 0; i < batchSize; ++i) {
+    flat->set(i, StringView((*strings)[i]));
+  }
+
+  // Each partition gets batchSize/numPartitions rows.
+  const vector_size_t partitionSize = batchSize / numPartitions;
+  BufferPtr sharedIndices =
+      AlignedBuffer::allocate<vector_size_t>(partitionSize, leafPool.get());
+
+  suspender.dismiss();
+
+  auto sinkPool = rootPool->addLeafChild("sink");
+  // Simulate writing all partitions from one batch, repeated.
+  for (int iter = 0; iter < kNumIterations; ++iter) {
+    for (int p = 0; p < numPartitions; ++p) {
+      auto sink = std::make_unique<MemorySink>(
+          kSinkSize, FileSink::Options{.pool = sinkPool.get()});
+      WriterOptions options;
+      options.memoryPool = rootPool.get();
+      options.formatSpecificOptions = std::make_shared<ParquetWriterOptions>();
+      auto writer = std::make_unique<parquet::Writer>(
+          std::move(sink), options, ROW({"c0"}, {VARCHAR()}));
+
+      // Fill indices selecting rows for this partition (strided pattern).
+      auto rawIndices = sharedIndices->asMutable<vector_size_t>();
+      for (vector_size_t i = 0; i < partitionSize; ++i) {
+        rawIndices[i] = p + i * numPartitions;
+      }
+      auto dictCol = BaseVector::wrapInDictionary(
+          BufferPtr(nullptr), sharedIndices, partitionSize, fullBatch);
+      auto data = std::make_shared<RowVector>(
+          leafPool.get(),
+          ROW({"c0"}, {VARCHAR()}),
+          BufferPtr(nullptr),
+          partitionSize,
+          std::vector<VectorPtr>{dictCol});
+      writer->write(data);
+      writer->close();
+    }
+  }
+}
+
+// 4 partitions from 10K batch, 10 unique values.
+BENCHMARK(PartitionRouting_4part_10K_10uniq) {
+  benchPartitionRouting(4, 10'000, 10);
+}
+// 4 partitions from 10K batch, 1000 unique values.
+BENCHMARK(PartitionRouting_4part_10K_1000uniq) {
+  benchPartitionRouting(4, 10'000, 1'000);
+}
+// 4 partitions from 100K batch, 10 unique values.
+BENCHMARK(PartitionRouting_4part_100K_10uniq) {
+  benchPartitionRouting(4, 100'000, 10);
+}
+// 4 partitions from 100K batch, 1000 unique values.
+BENCHMARK(PartitionRouting_4part_100K_1000uniq) {
+  benchPartitionRouting(4, 100'000, 1'000);
+}
+
+BENCHMARK_DRAW_LINE();
+
 // -- Flush estimation benchmarks --
 
 void benchFlushEstimation(int numBatches) {

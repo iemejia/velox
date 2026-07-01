@@ -1327,6 +1327,132 @@ TEST_F(ParquetWriterTest, dictionaryPassthroughWithNulls) {
   assertReadWithReaderAndExpected(schema, *rowReader, expected, *leafPool_);
 }
 
+/// Verifies that a dictionary vector whose values array contains nulls is
+/// correctly flattened before export. Arrow's Parquet writer does not support
+/// DictionaryArray when nulls are encoded in the dictionary values themselves
+/// (as opposed to the indices layer).
+TEST_F(ParquetWriterTest, dictionaryPassthroughNullsInValues) {
+  constexpr vector_size_t kSize = 2'000;
+  constexpr int kDictSize = 10;
+
+  // Build a dictionary values vector with nulls in it.
+  std::vector<std::string> dictStrings(kDictSize);
+  for (int i = 0; i < kDictSize; ++i) {
+    dictStrings[i] = fmt::format("v_{}", i);
+  }
+  auto dictionary = makeFlatVector<StringView>(
+      kDictSize,
+      [&](auto row) { return StringView(dictStrings[row]); },
+      [](auto row) { return row % 3 == 0; } /* nullAt: indices 0,3,6,9 */);
+  ASSERT_TRUE(dictionary->mayHaveNulls());
+
+  BufferPtr indices =
+      AlignedBuffer::allocate<vector_size_t>(kSize, leafPool_.get());
+  auto rawIndices = indices->asMutable<vector_size_t>();
+  for (vector_size_t i = 0; i < kSize; ++i) {
+    rawIndices[i] = i % kDictSize;
+  }
+
+  auto dictVector =
+      BaseVector::wrapInDictionary(nullptr, indices, kSize, dictionary);
+  ASSERT_EQ(dictVector->encoding(), VectorEncoding::Simple::DICTIONARY);
+
+  auto data = makeRowVector({dictVector});
+  auto schema = asRowType(data->type());
+
+  // Should not throw — the writer must flatten this dictionary before Arrow
+  // export because the values array contains nulls.
+  auto* sinkPtr = write(data, ParquetWriterOptions{});
+
+  auto reader = createReaderInMemory(*sinkPtr);
+  ASSERT_EQ(reader->numberOfRows(), kSize);
+
+  auto rowReader = createRowReaderFromReader(*reader, schema);
+  VectorPtr flatDict = dictVector;
+  BaseVector::flattenVector(flatDict);
+  auto expected = makeRowVector({flatDict});
+  assertReadWithReaderAndExpected(schema, *rowReader, expected, *leafPool_);
+}
+
+/// Verifies that writing multiple batches through the same writer does not
+/// corrupt data when dictionary vectors share an indices buffer with an
+/// external owner that reuses it for subsequent batches. This simulates the
+/// pattern used by FileDataSink::appendData where partitionRows_ buffers are
+/// reused across calls.
+TEST_F(ParquetWriterTest, dictionaryPassthroughMultiBatchSharedIndices) {
+  constexpr vector_size_t kBatchSize = 100;
+  constexpr int kNumBatches = 4;
+  constexpr int kDictSize = 20;
+
+  // Simulate FileDataSink's partitionRows_ buffer: a single indices buffer
+  // that is overwritten for each batch.
+  BufferPtr sharedIndices =
+      AlignedBuffer::allocate<vector_size_t>(kBatchSize, leafPool_.get());
+
+  // Build a dictionary (values array) — shared across all batches.
+  std::vector<std::string> dictStrings(kDictSize);
+  for (int i = 0; i < kDictSize; ++i) {
+    dictStrings[i] = fmt::format("value_{:03d}", i);
+  }
+  auto dictionary = makeFlatVector<StringView>(
+      kDictSize,
+      [&](auto row) { return StringView(dictStrings[row]); });
+
+  auto schema = asRowType(ROW({"c0"}, {VARCHAR()}));
+
+  // Write multiple batches, reusing the same indices buffer each time (like
+  // FileDataSink does). Each batch uses different index patterns.
+  auto sink = std::make_unique<dwio::common::MemorySink>(
+      200'000, dwio::common::FileSink::Options{.pool = leafPool_.get()});
+  auto* sinkPtr = sink.get();
+  dwio::common::WriterOptions writerOptions;
+  writerOptions.memoryPool = rootPool_.get();
+  writerOptions.formatSpecificOptions =
+      std::make_shared<ParquetWriterOptions>();
+  auto writer = std::make_unique<facebook::velox::parquet::Writer>(
+      std::move(sink), writerOptions, schema);
+
+  std::vector<RowVectorPtr> expectedBatches;
+  for (int batch = 0; batch < kNumBatches; ++batch) {
+    auto rawIndices = sharedIndices->asMutable<vector_size_t>();
+    // Each batch has a different index pattern.
+    for (vector_size_t i = 0; i < kBatchSize; ++i) {
+      rawIndices[i] = (i + batch * 3) % kDictSize;
+    }
+
+    auto dictVector = BaseVector::wrapInDictionary(
+        nullptr, sharedIndices, kBatchSize, dictionary);
+    auto data = makeRowVector({dictVector});
+    writer->write(data);
+
+    // Record expected flat values for verification.
+    VectorPtr flat = dictVector;
+    BaseVector::flattenVector(flat);
+    expectedBatches.push_back(makeRowVector({flat}));
+  }
+  writer->close();
+
+  // Read back and verify all rows match expectations.
+  auto reader = createReaderInMemory(*sinkPtr);
+  ASSERT_EQ(reader->numberOfRows(), kBatchSize * kNumBatches);
+
+  auto rowReader = createRowReaderFromReader(*reader, schema);
+  vector_size_t rowOffset = 0;
+  for (int batch = 0; batch < kNumBatches; ++batch) {
+    VectorPtr result;
+    ASSERT_TRUE(rowReader->next(kBatchSize, result));
+    auto resultRow = result->as<RowVector>();
+    auto resultCol = resultRow->childAt(0)->asFlatVector<StringView>();
+    auto expectedCol =
+        expectedBatches[batch]->childAt(0)->asFlatVector<StringView>();
+    for (vector_size_t i = 0; i < kBatchSize; ++i) {
+      ASSERT_EQ(resultCol->valueAt(i), expectedCol->valueAt(i))
+          << "Mismatch at batch " << batch << " row " << i;
+    }
+    rowOffset += kBatchSize;
+  }
+}
+
 /// Verifies that complex types (MAP, ARRAY, ROW) are written correctly without
 /// flattening when they are not wrapped in dictionary encoding.  This tests O2:
 /// the removal of the overly conservative isComplex check in needFlatten().
