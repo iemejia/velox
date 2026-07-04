@@ -438,6 +438,14 @@ class FileWriterImpl : public FileWriter {
     return Status::OK();
   }
 
+  Status flushBufferedRowGroup() override {
+    if (rowGroupWriter_ != nullptr) {
+      PARQUET_CATCH_NOT_OK(rowGroupWriter_->close());
+      rowGroupWriter_ = nullptr;
+    }
+    return Status::OK();
+  }
+
   Status writeRecordBatch(const RecordBatch& batch) override {
     if (batch.num_rows() == 0) {
       return Status::OK();

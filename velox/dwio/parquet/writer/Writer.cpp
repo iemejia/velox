@@ -109,10 +109,6 @@ struct ArrowContext {
   std::shared_ptr<WriterProperties> properties;
   uint64_t stagingRows = 0;
   int64_t stagingBytes = 0;
-
-  /// Set by flush() to force writeRecordBatch to start a new row group on the
-  /// next write.
-  bool forceNewRowGroup = false;
 };
 
 Compression::type getArrowParquetCompression(
@@ -449,8 +445,12 @@ Writer::Writer(
 
 void Writer::flush() {
   if (arrowContext_->stagingRows > 0) {
-    // Signal that the next writeRecordBatch should start a fresh row group.
-    arrowContext_->forceNewRowGroup = true;
+    if (arrowContext_->writer) {
+      // Complete the current buffered row group so its encoded/compressed
+      // data is written to the stream. This makes the bytes visible to
+      // callers that check raw written bytes for file-rotation decisions.
+      PARQUET_THROW_NOT_OK(arrowContext_->writer->flushBufferedRowGroup());
+    }
     PARQUET_THROW_NOT_OK(stream_->Flush());
     arrowContext_->stagingRows = 0;
     arrowContext_->stagingBytes = 0;
@@ -476,6 +476,13 @@ void Writer::write(const VectorPtr& data) {
   VELOX_USER_CHECK(
       data->type()->equivalent(*schema_),
       "The file schema type should be equal with the input rowvector type.");
+
+  // Nothing to write for an empty batch. Avoid creating the FileWriter so
+  // that close() will not produce a file (and commit task) for zero-row
+  // inputs.
+  if (data->size() == 0) {
+    return;
+  }
 
   VectorPtr exportData = data;
   if (needFlatten(exportData)) {
@@ -542,13 +549,6 @@ void Writer::write(const VectorPtr& data) {
             stream_,
             arrowContext_->properties,
             arrowProperties));
-  }
-
-  // If flush() was called since the last write, force a new row group so
-  // data written before and after the flush end up in separate groups.
-  if (arrowContext_->forceNewRowGroup) {
-    PARQUET_THROW_NOT_OK(arrowContext_->writer->newBufferedRowGroup());
-    arrowContext_->forceNewRowGroup = false;
   }
 
   // Write the batch directly. The Arrow writer manages buffered row groups
