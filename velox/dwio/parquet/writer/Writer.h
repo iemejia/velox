@@ -201,10 +201,23 @@ class Writer : public dwio::common::Writer {
   // Sets the memory reclaimers for all the memory pools used by this writer.
   void setMemoryReclaimers();
 
-  // Checks if the input data contains a nested wrapped vector or complex
-  // vector. If so, flatten the input to make it compatible with
-  // 'exportFlattenedVector' in Arrow export.
-  bool needFlatten(const VectorPtr& data) const;
+  // Prepares input data for Arrow export by selectively transforming columns:
+  //
+  // Full flatten (materialization) for:
+  //  - Dictionary wrapping a complex (non-primitive) type.
+  //  - Dictionary wrapping a non-flat inner vector (e.g., dict-of-dict).
+  //  - Dictionary whose values vector contains nulls (Arrow limitation).
+  //  - Constant wrapping a non-flat inner vector (e.g., constant-of-dict).
+  //
+  // Indices detach (copy only the indices buffer) for:
+  //  - Scalar dictionary vectors eligible for passthrough. This prevents
+  //    external owners (e.g., FileDataSink's partitionRows_) from corrupting
+  //    staged Arrow data by overwriting the shared indices buffer on
+  //    subsequent batches.
+  //
+  // Pass-through (no copy) for:
+  //  - Flat vectors and flat complex types.
+  VectorPtr flattenIfNeeded(const VectorPtr& data) const;
 
   // Pool for 'stream_'.
   std::shared_ptr<memory::MemoryPool> pool_;
@@ -222,7 +235,7 @@ class Writer : public dwio::common::Writer {
 
   const RowTypePtr schema_;
 
-  ArrowOptions options_{.flattenDictionary = true, .flattenConstant = true};
+  ArrowOptions options_{.flattenDictionary = false, .flattenConstant = true};
 
   // Whether to write Int96 timestamps in Arrow Parquet write.
   bool writeInt96AsTimestamp_;

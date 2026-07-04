@@ -50,12 +50,17 @@ void writeParquet(const RowVectorPtr& data, memory::MemoryPool* rootPool) {
 }
 
 /// Builds a dictionary-encoded VARCHAR column with the given cardinality.
+/// Dictionary values have variable lengths (5-50+ bytes) to simulate real-world
+/// categorical data like country names, status codes, and product categories.
 VectorPtr
 makeDictVarchar(vector_size_t numRows, int dictSize, memory::MemoryPool* pool) {
-  // Build stable string storage for the dictionary values.
+  // Build stable string storage for the dictionary values with variable sizes.
   auto strings = std::make_shared<std::vector<std::string>>(dictSize);
   for (int i = 0; i < dictSize; ++i) {
-    (*strings)[i] = fmt::format("value_{:06d}", i);
+    // Vary string length: short (5-10 chars) to long (40-60 chars) based on
+    // index, simulating real categorical data distributions.
+    std::string padding(i % 47, 'x');
+    (*strings)[i] = fmt::format("val_{}{}", i, padding);
   }
 
   auto dictionary = BaseVector::create(VARCHAR(), dictSize, pool);
@@ -99,7 +104,8 @@ VectorPtr makeFlatVarchar(vector_size_t numRows, memory::MemoryPool* pool) {
   auto* flat = vector->asFlatVector<StringView>();
   auto strings = std::make_shared<std::vector<std::string>>(numRows);
   for (vector_size_t i = 0; i < numRows; ++i) {
-    (*strings)[i] = fmt::format("value_{:06d}", i % 10);
+    std::string padding((i % 10) * 5, 'x');
+    (*strings)[i] = fmt::format("val_{}{}", i % 10, padding);
   }
   for (vector_size_t i = 0; i < numRows; ++i) {
     flat->set(i, StringView((*strings)[i]));
@@ -329,132 +335,332 @@ BENCHMARK(AllPassthrough_10Cols) {
 
 BENCHMARK_DRAW_LINE();
 
-// -- Parallel column writing benchmarks --
-// Compare serial vs parallel writing with ZSTD compression.
+// -- Null handling benchmarks --
+// These measure the cost of the indices detach (null at wrapping layer) vs
+// full flattening (null in dictionary values) vs no-null passthrough.
 
-void writeParquetWithOptions(
-    const RowVectorPtr& data,
-    memory::MemoryPool* rootPool,
-    bool parallel,
-    common::CompressionKind compression) {
-  auto leafPool = rootPool->addLeafChild("sink");
-  auto sink = std::make_unique<MemorySink>(
-      kSinkSize, FileSink::Options{.pool = leafPool.get()});
-  WriterOptions options;
-  options.memoryPool = rootPool;
-  options.compressionKind = compression;
-  auto parquetOpts = std::make_shared<ParquetWriterOptions>();
-  parquetOpts->enableParallelWrite = parallel;
-  options.formatSpecificOptions = parquetOpts;
-  auto writer = std::make_unique<parquet::Writer>(
-      std::move(sink), options, asRowType(data->type()));
-  writer->write(data);
-  writer->close();
-}
-
-void benchParallelWrite(int numCols, bool parallel) {
-  folly::BenchmarkSuspender suspender;
-  auto leafPool = rootPool->addLeafChild("bench");
-  constexpr vector_size_t kParBatchSize = 100'000;
-
-  std::vector<VectorPtr> columns;
-  std::vector<std::string> names;
-  std::vector<TypePtr> types;
-
-  for (int i = 0; i < numCols; ++i) {
-    columns.push_back(makeDictVarchar(kParBatchSize, 100, leafPool.get()));
-    names.push_back(fmt::format("c{}", i));
-    types.push_back(VARCHAR());
+/// Dictionary with nulls at the WRAPPING layer (indices null bitmap set).
+/// This follows the detach path: indices are copied, dictionary values shared.
+VectorPtr makeDictVarcharWithNullIndices(
+    vector_size_t numRows,
+    int dictSize,
+    double nullRatio,
+    memory::MemoryPool* pool) {
+  auto strings = std::make_shared<std::vector<std::string>>(dictSize);
+  for (int i = 0; i < dictSize; ++i) {
+    std::string padding(i % 47, 'x');
+    (*strings)[i] = fmt::format("val_{}{}", i, padding);
   }
 
+  auto dictionary = BaseVector::create(VARCHAR(), dictSize, pool);
+  auto* flat = dictionary->asFlatVector<StringView>();
+  for (int i = 0; i < dictSize; ++i) {
+    flat->set(i, StringView((*strings)[i]));
+  }
+
+  BufferPtr indices = AlignedBuffer::allocate<vector_size_t>(numRows, pool);
+  auto rawIndices = indices->asMutable<vector_size_t>();
+  for (vector_size_t i = 0; i < numRows; ++i) {
+    rawIndices[i] = i % dictSize;
+  }
+
+  // Create null bitmap at the wrapping layer.
+  BufferPtr nulls = AlignedBuffer::allocate<bool>(numRows, pool);
+  auto rawNulls = nulls->asMutable<uint64_t>();
+  for (vector_size_t i = 0; i < numRows; ++i) {
+    bits::setNull(rawNulls, i, (i % 100) < static_cast<int>(nullRatio * 100));
+  }
+
+  return BaseVector::wrapInDictionary(nulls, indices, numRows, dictionary);
+}
+
+/// Dictionary whose VALUES array contains nulls. This triggers full flattening
+/// because Arrow does not support DictionaryArray with nulls in the dictionary.
+VectorPtr makeDictVarcharWithNullValues(
+    vector_size_t numRows,
+    int dictSize,
+    double nullRatio,
+    memory::MemoryPool* pool) {
+  auto strings = std::make_shared<std::vector<std::string>>(dictSize);
+  for (int i = 0; i < dictSize; ++i) {
+    std::string padding(i % 47, 'x');
+    (*strings)[i] = fmt::format("val_{}{}", i, padding);
+  }
+
+  auto dictionary = BaseVector::create(VARCHAR(), dictSize, pool);
+  auto* flat = dictionary->asFlatVector<StringView>();
+  for (int i = 0; i < dictSize; ++i) {
+    if ((i % static_cast<int>(1.0 / nullRatio)) == 0) {
+      flat->setNull(i, true);
+    } else {
+      flat->set(i, StringView((*strings)[i]));
+    }
+  }
+
+  BufferPtr indices = AlignedBuffer::allocate<vector_size_t>(numRows, pool);
+  auto rawIndices = indices->asMutable<vector_size_t>();
+  for (vector_size_t i = 0; i < numRows; ++i) {
+    rawIndices[i] = i % dictSize;
+  }
+
+  return BaseVector::wrapInDictionary(
+      BufferPtr(nullptr), indices, numRows, dictionary);
+}
+
+void benchDictVarcharNullIndices(int dictSize, double nullRatio) {
+  folly::BenchmarkSuspender suspender;
+  auto leafPool = rootPool->addLeafChild("bench");
+  auto column = makeDictVarcharWithNullIndices(
+      kNumRows, dictSize, nullRatio, leafPool.get());
   auto data = std::make_shared<RowVector>(
       leafPool.get(),
-      ROW(std::move(names), std::move(types)),
+      ROW({"c0"}, {VARCHAR()}),
       BufferPtr(nullptr),
-      kParBatchSize,
-      std::move(columns));
-
+      kNumRows,
+      std::vector<VectorPtr>{column});
   suspender.dismiss();
-  writeParquetWithOptions(
-      data, rootPool.get(), parallel, common::CompressionKind_ZSTD);
+  writeParquet(data, rootPool.get());
 }
 
-BENCHMARK(Serial_10Cols_Zstd) {
-  benchParallelWrite(10, false);
+void benchDictVarcharNullValues(int dictSize, double nullRatio) {
+  folly::BenchmarkSuspender suspender;
+  auto leafPool = rootPool->addLeafChild("bench");
+  auto column = makeDictVarcharWithNullValues(
+      kNumRows, dictSize, nullRatio, leafPool.get());
+  auto data = std::make_shared<RowVector>(
+      leafPool.get(),
+      ROW({"c0"}, {VARCHAR()}),
+      BufferPtr(nullptr),
+      kNumRows,
+      std::vector<VectorPtr>{column});
+  suspender.dismiss();
+  writeParquet(data, rootPool.get());
 }
-BENCHMARK(Parallel_10Cols_Zstd) {
-  benchParallelWrite(10, true);
+
+// Null at wrapping layer: passthrough + detach (cheap memcpy of indices).
+BENCHMARK(DictVarchar_NullIndices_10pct_Card10) {
+  benchDictVarcharNullIndices(10, 0.1);
 }
-BENCHMARK(Serial_20Cols_Zstd) {
-  benchParallelWrite(20, false);
+BENCHMARK(DictVarchar_NullIndices_50pct_Card10) {
+  benchDictVarcharNullIndices(10, 0.5);
 }
-BENCHMARK(Parallel_20Cols_Zstd) {
-  benchParallelWrite(20, true);
+BENCHMARK(DictVarchar_NullIndices_10pct_Card1000) {
+  benchDictVarcharNullIndices(1'000, 0.1);
+}
+BENCHMARK(DictVarchar_NullIndices_50pct_Card1000) {
+  benchDictVarcharNullIndices(1'000, 0.5);
 }
 
 BENCHMARK_DRAW_LINE();
 
-// -- Multi-batch benchmarks for schema caching --
-// These write many small batches to the same file.  Without schema caching,
-// each batch re-exports, re-imports, and re-walks the Arrow schema.  With
-// caching, only the first batch pays that cost.
-
-/// Writes numBatches batches of batchSize rows each to a single file.
-void writeParquetMultiBatch(
-    const RowVectorPtr& batch,
-    int numBatches,
-    memory::MemoryPool* rootPool) {
-  auto leafPool = rootPool->addLeafChild("sink");
-  auto sink = std::make_unique<MemorySink>(
-      kSinkSize, FileSink::Options{.pool = leafPool.get()});
-  WriterOptions options;
-  options.memoryPool = rootPool;
-  options.formatSpecificOptions = std::make_shared<ParquetWriterOptions>();
-  auto writer = std::make_unique<parquet::Writer>(
-      std::move(sink), options, asRowType(batch->type()));
-  for (int i = 0; i < numBatches; ++i) {
-    writer->write(batch);
-  }
-  writer->close();
+// Null in dictionary values: forced full flatten (expensive materialization).
+BENCHMARK(DictVarchar_NullValues_10pct_Card10) {
+  benchDictVarcharNullValues(10, 0.1);
+}
+BENCHMARK(DictVarchar_NullValues_50pct_Card10) {
+  benchDictVarcharNullValues(10, 0.5);
+}
+BENCHMARK(DictVarchar_NullValues_10pct_Card1000) {
+  benchDictVarcharNullValues(1'000, 0.1);
+}
+BENCHMARK(DictVarchar_NullValues_50pct_Card1000) {
+  benchDictVarcharNullValues(1'000, 0.5);
 }
 
-void benchMultiBatch(int numCols, int numBatches) {
+BENCHMARK_DRAW_LINE();
+
+// -- Multi-batch with shared indices (FileDataSink pattern) --
+// Measures the cost of indices detach across multiple write() calls where the
+// same buffer is reused (simulating partitioned writes).
+
+void benchMultiBatchSharedIndices(int numBatches, int dictSize) {
+  folly::BenchmarkSuspender suspender;
+  auto leafPool = rootPool->addLeafChild("bench");
+  constexpr vector_size_t kBatchSize = 10'000;
+
+  auto strings = std::make_shared<std::vector<std::string>>(dictSize);
+  for (int i = 0; i < dictSize; ++i) {
+    std::string padding(i % 47, 'x');
+    (*strings)[i] = fmt::format("val_{}{}", i, padding);
+  }
+  auto dictionary = BaseVector::create(VARCHAR(), dictSize, leafPool.get());
+  auto* flat = dictionary->asFlatVector<StringView>();
+  for (int i = 0; i < dictSize; ++i) {
+    flat->set(i, StringView((*strings)[i]));
+  }
+
+  // Shared indices buffer, overwritten each batch (like partitionRows_).
+  BufferPtr sharedIndices =
+      AlignedBuffer::allocate<vector_size_t>(kBatchSize, leafPool.get());
+
+  suspender.dismiss();
+
+  auto sinkPool = rootPool->addLeafChild("sink");
+  for (int iter = 0; iter < kNumIterations; ++iter) {
+    auto sink = std::make_unique<MemorySink>(
+        kSinkSize, FileSink::Options{.pool = sinkPool.get()});
+    WriterOptions options;
+    options.memoryPool = rootPool.get();
+    options.formatSpecificOptions = std::make_shared<ParquetWriterOptions>();
+    auto writer = std::make_unique<parquet::Writer>(
+        std::move(sink), options, ROW({"c0"}, {VARCHAR()}));
+    for (int batch = 0; batch < numBatches; ++batch) {
+      auto rawIndices = sharedIndices->asMutable<vector_size_t>();
+      for (vector_size_t i = 0; i < kBatchSize; ++i) {
+        rawIndices[i] = (i + batch * 7) % dictSize;
+      }
+      auto dictCol = BaseVector::wrapInDictionary(
+          BufferPtr(nullptr), sharedIndices, kBatchSize, dictionary);
+      auto data = std::make_shared<RowVector>(
+          leafPool.get(),
+          ROW({"c0"}, {VARCHAR()}),
+          BufferPtr(nullptr),
+          kBatchSize,
+          std::vector<VectorPtr>{dictCol});
+      writer->write(data);
+    }
+    writer->close();
+  }
+}
+
+BENCHMARK(MultiBatch_10x10K_Card10_SharedIdx) {
+  benchMultiBatchSharedIndices(10, 10);
+}
+BENCHMARK(MultiBatch_50x10K_Card10_SharedIdx) {
+  benchMultiBatchSharedIndices(50, 10);
+}
+BENCHMARK(MultiBatch_10x10K_Card1000_SharedIdx) {
+  benchMultiBatchSharedIndices(10, 1'000);
+}
+BENCHMARK(MultiBatch_50x10K_Card1000_SharedIdx) {
+  benchMultiBatchSharedIndices(50, 1'000);
+}
+
+BENCHMARK_DRAW_LINE();
+
+// -- Partition routing simulation (exec::wrap pattern) --
+// The dictionary IS the full original flat vector (with duplicates), and the
+// indices select a subset of rows. This is what FileDataSink actually produces
+// when partitioning.
+
+void benchPartitionRouting(int numPartitions, int batchSize, int numUnique) {
   folly::BenchmarkSuspender suspender;
   auto leafPool = rootPool->addLeafChild("bench");
 
-  std::vector<VectorPtr> columns;
-  std::vector<std::string> names;
-  std::vector<TypePtr> types;
-  constexpr vector_size_t kBatchSize = 10'000;
-
-  for (int i = 0; i < numCols; ++i) {
-    columns.push_back(makeDictVarchar(kBatchSize, 10, leafPool.get()));
-    names.push_back(fmt::format("c{}", i));
-    types.push_back(VARCHAR());
+  // Build a flat vector representing the original batch (with duplicates).
+  auto strings = std::make_shared<std::vector<std::string>>(batchSize);
+  for (int i = 0; i < batchSize; ++i) {
+    int idx = i % numUnique;
+    std::string padding(idx % 47, 'x');
+    (*strings)[i] = fmt::format("val_{}{}", idx, padding);
+  }
+  auto fullBatch = BaseVector::create(VARCHAR(), batchSize, leafPool.get());
+  auto* flat = fullBatch->asFlatVector<StringView>();
+  for (int i = 0; i < batchSize; ++i) {
+    flat->set(i, StringView((*strings)[i]));
   }
 
-  auto batch = std::make_shared<RowVector>(
-      leafPool.get(),
-      ROW(std::move(names), std::move(types)),
-      BufferPtr(nullptr),
-      kBatchSize,
-      std::move(columns));
+  // Each partition gets batchSize/numPartitions rows.
+  const vector_size_t partitionSize = batchSize / numPartitions;
+  BufferPtr sharedIndices =
+      AlignedBuffer::allocate<vector_size_t>(partitionSize, leafPool.get());
 
   suspender.dismiss();
-  writeParquetMultiBatch(batch, numBatches, rootPool.get());
+
+  auto sinkPool = rootPool->addLeafChild("sink");
+  // Simulate writing all partitions from one batch, repeated.
+  for (int iter = 0; iter < kNumIterations; ++iter) {
+    for (int p = 0; p < numPartitions; ++p) {
+      auto sink = std::make_unique<MemorySink>(
+          kSinkSize, FileSink::Options{.pool = sinkPool.get()});
+      WriterOptions options;
+      options.memoryPool = rootPool.get();
+      options.formatSpecificOptions = std::make_shared<ParquetWriterOptions>();
+      auto writer = std::make_unique<parquet::Writer>(
+          std::move(sink), options, ROW({"c0"}, {VARCHAR()}));
+
+      // Fill indices selecting rows for this partition (strided pattern).
+      auto rawIndices = sharedIndices->asMutable<vector_size_t>();
+      for (vector_size_t i = 0; i < partitionSize; ++i) {
+        rawIndices[i] = p + i * numPartitions;
+      }
+      auto dictCol = BaseVector::wrapInDictionary(
+          BufferPtr(nullptr), sharedIndices, partitionSize, fullBatch);
+      auto data = std::make_shared<RowVector>(
+          leafPool.get(),
+          ROW({"c0"}, {VARCHAR()}),
+          BufferPtr(nullptr),
+          partitionSize,
+          std::vector<VectorPtr>{dictCol});
+      writer->write(data);
+      writer->close();
+    }
+  }
 }
 
-BENCHMARK(MultiBatch_5Cols_50Batches) {
-  benchMultiBatch(5, 50);
+// 4 partitions from 10K batch, 10 unique values.
+BENCHMARK(PartitionRouting_4part_10K_10uniq) {
+  benchPartitionRouting(4, 10'000, 10);
 }
-BENCHMARK(MultiBatch_10Cols_50Batches) {
-  benchMultiBatch(10, 50);
+// 4 partitions from 10K batch, 1000 unique values.
+BENCHMARK(PartitionRouting_4part_10K_1000uniq) {
+  benchPartitionRouting(4, 10'000, 1'000);
 }
-BENCHMARK(MultiBatch_20Cols_50Batches) {
-  benchMultiBatch(20, 50);
+// 4 partitions from 100K batch, 10 unique values.
+BENCHMARK(PartitionRouting_4part_100K_10uniq) {
+  benchPartitionRouting(4, 100'000, 10);
 }
-BENCHMARK(MultiBatch_10Cols_200Batches) {
-  benchMultiBatch(10, 200);
+// 4 partitions from 100K batch, 1000 unique values.
+BENCHMARK(PartitionRouting_4part_100K_1000uniq) {
+  benchPartitionRouting(4, 100'000, 1'000);
+}
+
+BENCHMARK_DRAW_LINE();
+
+// -- Flush estimation benchmarks --
+
+void benchFlushEstimation(int numBatches) {
+  folly::BenchmarkSuspender suspender;
+  auto leafPool = rootPool->addLeafChild("bench");
+  constexpr vector_size_t kBatchSize = 10'000;
+  constexpr int kDictSize = 10;
+
+  auto dict = makeDictVarchar(kBatchSize, kDictSize, leafPool.get());
+  auto batch = std::make_shared<RowVector>(
+      leafPool.get(),
+      ROW({"c0"}, {VARCHAR()}),
+      BufferPtr(nullptr),
+      kBatchSize,
+      std::vector<VectorPtr>{dict});
+
+  suspender.dismiss();
+
+  auto sinkPool = rootPool->addLeafChild("sink");
+  for (int iter = 0; iter < kNumIterations; ++iter) {
+    auto sink = std::make_unique<MemorySink>(
+        kSinkSize, FileSink::Options{.pool = sinkPool.get()});
+    WriterOptions options;
+    options.memoryPool = rootPool.get();
+    options.flushPolicyFactory = []() {
+      return std::make_unique<DefaultFlushPolicy>(
+          /*rowsInRowGroup=*/1'000'000,
+          /*bytesInRowGroup=*/512 * 1'024);
+    };
+    options.formatSpecificOptions = std::make_shared<ParquetWriterOptions>();
+    auto writer = std::make_unique<parquet::Writer>(
+        std::move(sink), options, asRowType(batch->type()));
+    for (int i = 0; i < numBatches; ++i) {
+      writer->write(batch);
+    }
+    writer->close();
+  }
+}
+
+BENCHMARK(FlushEstimation_50Batches) {
+  benchFlushEstimation(50);
+}
+BENCHMARK(FlushEstimation_200Batches) {
+  benchFlushEstimation(200);
 }
 
 } // namespace

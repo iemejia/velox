@@ -30,9 +30,7 @@ target_link_libraries(
   velox_constrained_vector_generator
 )
 
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  target_compile_options(velox_vector_fuzzer PRIVATE -Wno-deprecated-declarations)
-endif()
+target_compile_options(velox_vector_fuzzer PRIVATE -Wno-deprecated-declarations)
 
 add_library(velox_constrained_vector_generator ConstrainedVectorGenerator.cpp)
 velox_add_test_headers(velox_constrained_vector_generator ConstrainedVectorGenerator.h)

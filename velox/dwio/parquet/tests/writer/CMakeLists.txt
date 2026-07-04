@@ -33,6 +33,18 @@ target_link_libraries(
   fmt::fmt
 )
 
+add_executable(velox_parquet_writer_benchmark ParquetWriterBenchmark.cpp)
+
+target_link_libraries(
+  velox_parquet_writer_benchmark
+  velox_dwio_parquet_writer
+  velox_caching
+  velox_link_libs
+  Folly::folly
+  Folly::follybenchmark
+  fmt::fmt
+)
+
 add_executable(velox_parquet_writer_test ParquetWriterFieldIdTest.cpp ParquetWriterTest.cpp)
 
 add_test(

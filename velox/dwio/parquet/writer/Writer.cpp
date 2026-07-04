@@ -17,6 +17,7 @@
 #include "velox/dwio/parquet/writer/Writer.h"
 
 #include <algorithm>
+#include <cstring>
 #include <exception>
 
 #include <arrow/c/bridge.h>
@@ -484,30 +485,40 @@ void Writer::write(const VectorPtr& data) {
     return;
   }
 
-  VectorPtr exportData = data;
-  if (needFlatten(exportData)) {
-    BaseVector::flattenVector(exportData);
-  }
+  VectorPtr exportData = flattenIfNeeded(data);
 
   ArrowArray array;
   exportToArrow(exportData, array, generalPool_.get(), options_);
 
-  if (!arrowContext_->schema) {
-    // First batch: export and fix up the Arrow schema, then cache it.
-    ArrowSchema schema;
-    exportToArrow(exportData, schema, options_);
+  // Derive a per-batch schema that matches the actual exported data's encoding
+  // (flat or dictionary per column). This is used for ImportRecordBatch below.
+  ArrowSchema batchArrowSchema;
+  exportToArrow(exportData, batchArrowSchema, options_);
+  auto batchSchema = ::arrow::ImportSchema(&batchArrowSchema).ValueOrDie();
 
-    auto arrowSchema = ::arrow::ImportSchema(&schema).ValueOrDie();
+  if (!arrowContext_->schema) {
+    // First batch: build and cache the writer schema (always flat, with
+    // Parquet field IDs and corrected names). The writer schema is used to
+    // open the FileWriter. Since writeRecordBatch does not validate the
+    // RecordBatch schema against the writer's schema, we can pass
+    // DictionaryArrays even though the writer schema is flat.
     common::testutil::TestValue::adjust(
-        "facebook::velox::parquet::Writer::write", arrowSchema.get());
+        "facebook::velox::parquet::Writer::write", batchSchema.get());
     std::vector<std::shared_ptr<::arrow::Field>> newFields;
     auto childSize = schema_->size();
     if (!parquetFieldIds_.empty()) {
       VELOX_CHECK(childSize == parquetFieldIds_.size());
     }
     for (auto i = 0; i < childSize; i++) {
+      auto field = batchSchema->fields()[i];
+      // Strip dictionary type to get the flat value type for the writer schema.
+      if (field->type()->id() == ::arrow::Type::DICTIONARY) {
+        auto dictType =
+            std::dynamic_pointer_cast<::arrow::DictionaryType>(field->type());
+        field = field->WithType(dictType->value_type());
+      }
       newFields.push_back(updateFieldNameAndIdRecursive(
-          arrowSchema->fields()[i],
+          field,
           *schema_->childAt(i),
           !parquetFieldIds_.empty() ? &parquetFieldIds_.at(i) : nullptr,
           schema_->nameOf(i)));
@@ -516,12 +527,23 @@ void Writer::write(const VectorPtr& data) {
     arrowContext_->schema = ::arrow::schema(newFields);
   }
 
-  // Import the data array using the cached schema.
+  // Import the data array using the per-batch schema (matches the actual
+  // encoding of this batch). This avoids cross-batch schema mismatch issues
+  // when encodings vary between batches.
   PARQUET_ASSIGN_OR_THROW(
       auto recordBatch,
-      ::arrow::ImportRecordBatch(&array, arrowContext_->schema));
+      ::arrow::ImportRecordBatch(&array, batchSchema));
 
-  auto bytes = data->estimateFlatSize();
+  // Use retainedSize() rather than estimateFlatSize() for the flush policy
+  // size estimate. estimateFlatSize() computes the fully materialized size of
+  // dictionary columns (rows * avgValueSize), which greatly overestimates the
+  // actual data written when dictionaries pass through without flattening.
+  // retainedSize() reports the actual memory footprint (dictionary values +
+  // index buffer), matching what is encoded in the Parquet file.
+  // Use exportData (post-flatten) so that columns forced through flattening
+  // (e.g., dict-of-dict, selection dictionaries) report their materialized
+  // size rather than the compact dictionary representation.
+  auto bytes = exportData->retainedSize();
   auto numRows = data->size();
 
   // Check flush policy before writing. Flush closes the current buffered
@@ -610,20 +632,102 @@ void Writer::setMemoryReclaimers() {
   generalPool_->setReclaimer(exec::MemoryReclaimer::create());
 }
 
-bool Writer::needFlatten(const VectorPtr& data) const {
+namespace {
+
+/// Returns true if a single column requires flattening before Arrow export.
+/// Dictionary vectors that pass all checks are eligible for passthrough to the
+/// Arrow Parquet writer which handles them natively via putDictionary.
+bool childNeedsFlatten(const VectorPtr& child) {
+  auto encoding = child->encoding();
+  if (encoding == VectorEncoding::Simple::DICTIONARY) {
+    auto* innerVector = child->valueVector().get();
+    if (innerVector != nullptr) {
+      // Flatten dictionary wrapping a complex (non-primitive) type.
+      if (!innerVector->type()->isPrimitiveType()) {
+        return true;
+      }
+      // Flatten nested wrapping (e.g., dictionary-of-dictionary).
+      if (!innerVector->isFlatEncoding()) {
+        return true;
+      }
+      // Flatten if the dictionary values contain nulls. Arrow's Parquet
+      // writer does not support DictionaryArray with nulls in the values.
+      if (innerVector->mayHaveNulls()) {
+        return true;
+      }
+      // Flatten "selection dictionaries" (dictionary larger than vector) and
+      // oversized dictionaries where Arrow's putDictionary is slower than
+      // the vectorized flat encoding path.
+      constexpr vector_size_t kMaxPassthroughDictSize = 4'096;
+      if (innerVector->size() > child->size() ||
+          innerVector->size() > kMaxPassthroughDictSize) {
+        return true;
+      }
+    }
+  } else if (encoding == VectorEncoding::Simple::CONSTANT) {
+    if (child->valueVector() && !child->wrappedVector()->isFlatEncoding()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// Returns true if a dictionary child should have its indices detached.
+bool childNeedsDetach(const VectorPtr& child) {
+  return child->encoding() == VectorEncoding::Simple::DICTIONARY &&
+      !childNeedsFlatten(child);
+}
+
+} // namespace
+
+VectorPtr Writer::flattenIfNeeded(const VectorPtr& data) const {
   auto rowVector = std::dynamic_pointer_cast<RowVector>(data);
   VELOX_CHECK_NOT_NULL(
       rowVector, "Arrow export expects a RowVector as input data.");
 
   const auto& children = rowVector->children();
-  return std::any_of(children.begin(), children.end(), [](const auto& child) {
-    bool isNestedWrapped =
-        (child->encoding() == VectorEncoding::Simple::DICTIONARY ||
-         child->encoding() == VectorEncoding::Simple::CONSTANT) &&
-        child->valueVector() && !child->wrappedVector()->isFlatEncoding();
-    bool isComplex = !child->isScalar();
-    return isNestedWrapped || isComplex;
-  });
+  bool anyNeedsWork = false;
+  for (const auto& child : children) {
+    if (childNeedsFlatten(child) || childNeedsDetach(child)) {
+      anyNeedsWork = true;
+      break;
+    }
+  }
+
+  if (!anyNeedsWork) {
+    return data;
+  }
+
+  // Selectively flatten or detach only the columns that need it.
+  std::vector<VectorPtr> newChildren(children.size());
+  for (size_t i = 0; i < children.size(); ++i) {
+    if (childNeedsFlatten(children[i])) {
+      newChildren[i] = children[i];
+      BaseVector::flattenVector(newChildren[i]);
+    } else if (childNeedsDetach(children[i])) {
+      const auto& dict = children[i];
+      auto srcIndices = dict->wrapInfo();
+      const auto numBytes = dict->size() * sizeof(vector_size_t);
+      auto newIndices = AlignedBuffer::allocate<vector_size_t>(
+          dict->size(), generalPool_.get());
+      std::memcpy(
+          newIndices->asMutable<char>(), srcIndices->as<char>(), numBytes);
+      newChildren[i] = BaseVector::wrapInDictionary(
+          dict->nulls(),
+          std::move(newIndices),
+          dict->size(),
+          dict->valueVector());
+    } else {
+      newChildren[i] = children[i];
+    }
+  }
+
+  return std::make_shared<RowVector>(
+      rowVector->pool(),
+      rowVector->type(),
+      rowVector->nulls(),
+      rowVector->size(),
+      std::move(newChildren));
 }
 
 std::unique_ptr<dwio::common::Writer> ParquetWriterFactory::createWriter(
