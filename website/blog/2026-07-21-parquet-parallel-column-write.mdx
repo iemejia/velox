@@ -1,80 +1,83 @@
 ---
 slug: parquet-parallel-column-write
-title: "The Parquet Writer Is Serial: A Parallel-Column-Write Experiment and Its ~1.7x Ceiling"
+title: "Parallel Parquet Column Writes in Velox: An Experiment With Diminishing Returns"
 date: 2026-07-21
 authors: [iemejia]
 tags: [tech-blog, performance, parquet]
-description: "We added parallel column encoding and compression to the Velox Parquet writer, measured it end to end, and found a bounded ~1.3-1.6x win that plateaus by 4 threads. Amdahl's law explains why: ~58% of column-write time is serial."
+description: "Parallel Parquet column writes reached 1.53-1.57x at eight workers in two in-memory Velox benchmarks, but the gains did not justify the execution and memory costs."
 ---
 
 ## TL;DR
 
-The Velox Parquet writer compresses and encodes columns one at a time. Arrow's
-writer can do that work concurrently, so parallelizing it looks like an easy
-win — especially for wide tables under heavy compression.
+The Arrow Parquet writer vendored by Velox already has a path that writes
+top-level columns concurrently. We built an experimental Velox option around
+that path using a dedicated, per-writer thread pool, then measured the complete
+in-memory writer lifecycle on an eight-core machine.
 
-We implemented it: a `writer.column-write-parallelism` option that hands column
-encode/compress to a dedicated, Velox-owned thread pool. Then we measured it end
-to end. The result is a real but **bounded ~1.3-1.6x speedup that plateaus by
-~4 threads**, on both dictionary and compression-bound workloads, and costs one
-thread pool per writer plus per-column scratch memory.
+At eight workers, the experiment reached **1.53x** on low-cardinality VARCHAR
+data and **1.57x** on a much heavier flat VARCHAR workload. Both continued to
+improve from four to eight workers, but with diminishing returns. Threaded mode
+also retained one scratch context per top-level column in addition to the
+writer's serial context.
 
-Backing the numbers out with Amdahl's law, **~58% of column-write time is
-serial** — row-group assembly into a single output stream, definition-level
-computation, and shared memory-pool locking — so the ceiling is **~1.7x no
-matter how many threads you throw at it**. Given that ceiling, the feature does
-not clear the bar for landing. This post captures why, so the next person who
-reaches for parallel column writing starts from the answer.
+For the heavier workload, the scaling curve is consistent with an idealized
+[Amdahl's law](https://en.wikipedia.org/wiki/Amdahl%27s_law) model having an
+effective non-scaling fraction of about 59%. If that fraction remained constant,
+the model would approach roughly 1.7x. This is a workload-specific
+extrapolation, not a measured architectural ceiling: the benchmark did not
+separate serial work from scheduling overhead, contention, memory effects, or
+task imbalance.
+
+Given the measured gains, per-writer pool, per-column context memory, and added
+support burden, the feature was not landed. The implementation remains on the
+branch from [PR #18128](https://github.com/facebookincubator/velox/pull/18128)
+in case future measurements change that decision.
 
 <!-- truncate -->
 
-## Background: how the Velox Parquet writer writes
+## Background: where column concurrency exists
 
-Velox writes Parquet through a vendored copy of Arrow's Parquet writer. On each
-`write()`, Velox exports the incoming `RowVector` to an Arrow `RecordBatch` and
-calls `FileWriter::writeRecordBatch`. Internally, Arrow walks the columns and
-encodes and compresses each one into the current row group.
+Velox writes Parquet through a vendored copy of Arrow's Parquet writer. For
+each input batch, Velox exports the `RowVector` to an Arrow `RecordBatch` and
+calls `FileWriter::writeRecordBatch`.
 
-That per-column loop is exactly where concurrency is available. Arrow already
-has the machinery: when its writer is configured to use threads, it runs the
-loop through `::arrow::internal::ParallelFor` over the per-column writers:
+The Arrow writer first constructs one `ArrowColumnWriterV2` for each top-level
+Arrow field. When threading is enabled, it then submits each writer's complete
+`write()` operation through `::arrow::internal::ParallelFor`:
 
 ```cpp
 if (arrowProperties_->useThreads()) {
   RETURN_NOT_OK(::arrow::internal::ParallelFor(
       static_cast<int>(writers.size()),
-      [&](int i) { return writers[i]->write(&parallelColumnWriteContexts_[i]); },
+      [&](int i) {
+        return writers[i]->write(&parallelColumnWriteContexts_[i]);
+      },
       arrowProperties_->executor()));
 }
 ```
 
-So the Velox side does not need to write any parallel code. It only needs to
-turn threading on and provide an executor to run the column tasks on.
+The task is broader than compression and encoding. It also performs
+definition- and repetition-level generation, physical conversion where needed,
+statistics collection, page formation, and buffered serialization for the
+field. A nested top-level field still corresponds to one task; its Parquet leaf
+columns are processed within that task.
 
-## The idea and the hypothesis
+Some work remains outside `ParallelFor`. In particular, top-level column
+writers and path builders are constructed before task submission, and buffered
+column writers are closed in order when the row group is finalized. Source
+inspection establishes that these phases are sequential, but it does not tell
+us how much of the measured time they consume.
 
-Encoding and compression are per-column, CPU-bound, and independent, so spreading
-them across cores should shorten wall time as columns and compression cost grow.
-The working hypothesis was specifically:
+## The experiment
 
-> The dictionary case has a tiny post-encoding payload, so it is not
-> compression-bound. A **flat, high-entropy** workload with real compression
-> work should parallelize much better.
+The first prototype added a Boolean option that enabled Arrow threading without
+providing an executor. A null executor makes Arrow use its global process-wide
+CPU pool. This gave Velox no control over the pool or its size and exposed the
+documented starvation/deadlock scenario in which outer write operations occupy
+the same executor needed by the column tasks they synchronously await.
 
-That hypothesis is the crux, and — spoiler — the measurements refute it.
-
-## The design: own the executor, avoid the deadlock
-
-The first version was a `bool enableParallelWrite` that flipped Arrow's
-`setUseThreads(true)` with a null executor, which falls back to Arrow's
-**global, process-wide CPU pool**. That has two problems: Velox controls neither
-the thread count nor pool sharing, and it carries a deadlock caveat — if the
-executor driving `write()` is the same pool the column tasks run on, the writers
-can wait on tasks that can never be scheduled.
-
-The design that addresses both is to let Velox own a dedicated executor. When
-`columnWriteParallelism > 1`, the writer creates and owns an Arrow `ThreadPool`
-and wires it in explicitly:
+The revised experiment made the parallelism an integer. When it was greater
+than one, each Velox writer created and owned a dedicated Arrow `ThreadPool`:
 
 ```cpp
 columnWriteParallelism_ =
@@ -86,142 +89,192 @@ if (columnWriteParallelism_ > 1) {
 }
 ```
 
+The pool was then passed explicitly to Arrow:
+
 ```cpp
 if (columnWriteExecutor_) {
-  // Compress and encode columns concurrently on a dedicated thread pool that
-  // Velox owns. It is distinct from the executor driving write(), so column
-  // tasks cannot deadlock against the writers waiting on them.
   builder.setUseThreads(true);
   builder.setExecutor(columnWriteExecutor_.get());
 }
 ```
 
-Because the pool is per-writer and distinct from the executor driving `write()`,
-column tasks cannot deadlock against the writers waiting on them, and the "do not
-enable this when writing files concurrently" caveat disappears. It is exposed as:
+This design removes the documented same-executor starvation scenario because
+the inner column tasks do not share the executor driving the outer writes. It
+does not claim to eliminate every possible source of deadlock.
 
-- connector config: `writer.column-write-parallelism` (int, default 1)
+The experiment exposed two branch-only settings:
+
+- connector config: `writer.column-write-parallelism` (integer, default 1)
 - session property: `writer_column_write_parallelism`
 
-## The memory cost
+These settings were proposed in #18128 but never shipped in Velox.
 
-Parallelism is not free even before we look at speed. In serial mode, Arrow
-reuses a single scratch `ArrowWriteContext` — the def-levels and
-physical-conversion buffers — across all columns. In parallel mode it must give
-each concurrent column its own, so it allocates one context **per column** up
-front:
+## Context-buffer memory
 
-```cpp
-if (arrowProperties_->useThreads()) {
-  parallelColumnWriteContexts_.reserve(schema_->num_fields());
-  for (int i = 0; i < schema_->num_fields(); ++i) {
-    parallelColumnWriteContexts_.emplace_back(pool, arrowProperties_.get());
-  }
-}
-```
+The Arrow writer always creates one serial `ArrowWriteContext`, which serial
+mode reuses across fields. Threaded mode additionally creates one context per
+top-level Arrow field so that field tasks do not share the definition-level and
+physical-conversion buffers. Those per-field contexts are used by the tasks and
+grow lazily as data is processed, while the serial context remains unused.
 
-Measured through a tracking Arrow memory pool (100K-row row groups, dictionary
-VARCHAR), the scratch is set by **column count, not thread count**:
+A separate allocator experiment measured the context-buffer allocations for
+100K-row, low-cardinality VARCHAR batches. These figures are not total writer
+memory: they exclude output buffering, exported Arrow arrays, encoder and
+compressor allocations outside these contexts, thread stacks, and the thread
+pool itself.
 
-| Columns | Serial | Parallel |
-| ------: | -----: | -------: |
-| 1       | 200 KB | 200 KB   |
-| 4       | 200 KB | 800 KB   |
-| 10      | 200 KB | 2.0 MB   |
-| 20      | 200 KB | 4.0 MB   |
-| 40      | 200 KB | 8.0 MB   |
+| Top-level columns | Serial | Threaded |
+| ----------------: | -----: | -------: |
+| 1                 | 200 KB | 200 KB   |
+| 4                 | 200 KB | 800 KB   |
+| 10                | 200 KB | 2.0 MB   |
+| 20                | 200 KB | 4.0 MB   |
+| 40                | 200 KB | 8.0 MB   |
 
-At a fixed 20 columns, going from 2 to 8 threads keeps peak scratch flat at
-4.0 MB — the contexts are per-column and all live simultaneously regardless of
-pool size. Per-context (~200 KB here) is dominated by the def-levels buffer
-(~2 bytes/row), so it scales with row-group row count, not data size. It is not
-a copy of the column, but it is real, and it grows with table width.
+At 20 columns, the measured context allocation remained 4.0 MB at two, four,
+and eight workers. The count follows the number of top-level field tasks, not
+the worker count. The approximately 200 KB per context is specific to this
+100K-row VARCHAR case; context capacity varies with batch size, physical type,
+nullability, and nesting.
 
-## Measurements
+## Benchmark methodology
 
-All timings are release builds (debug inflates the speedup in the feature's
-favor by ballooning per-column compute, so its numbers are not trustworthy for
-this question). 20 columns, 100K rows, ZSTD, on an 8-core box. Two workloads:
-a dictionary VARCHAR (cardinality 100) and a flat high-entropy VARCHAR with
-~16x more bytes to compress.
+The timing experiment used a release build on one eight-core development
+machine. Each case wrote one batch containing 20 top-level VARCHAR columns and
+100K rows with ZSTD enabled.
 
-| Threads | Dict VARCHAR    | Flat high-entropy (~16x more bytes) |
-| ------: | --------------: | ----------------------------------: |
-| 1       | 59.7 ms (1.00x) | 877 ms (1.00x)                      |
-| 2       | 56.8 ms (1.05x) | 701 ms (1.25x)                      |
-| 4       | 48.5 ms (1.23x) | 607 ms (1.44x)                      |
-| 8       | 39.1 ms (1.53x) | 558 ms (1.57x)                      |
+Input-vector construction was excluded from timing, but input-vector and
+benchmark-pool destruction remained inside the timed region. The timed region
+included:
 
-## The hypothesis was refuted
+- sink-pool and 200 MiB in-memory `MemorySink` construction;
+- Velox writer and dedicated thread-pool construction;
+- Velox-to-Arrow export and Arrow writer initialization;
+- level generation, encoding, compression, and buffered column writes;
+- row-group and file close, including in-memory output copying;
+- writer, input-vector, and benchmark-pool destruction at the end of the
+  operation.
 
-The flat workload does ~16x more compression work than the dictionary one. If
-compression were the parallelizable bottleneck, it should scale much better.
-It does not: it tops out at **1.57x**, essentially equal to the dictionary
-case's **1.53x**, and both plateau by ~4 threads. More compression work did not
-buy more parallelism.
+The benchmark therefore measures a one-shot, in-memory writer lifecycle. It
+does not measure filesystem or object-store I/O, and it does not isolate the
+time spent in compression or in the Arrow `ParallelFor` region. The table below
+contains the benchmark's reported point estimates; results on other hardware
+or with long-lived writers may differ.
 
-[Amdahl's law](https://en.wikipedia.org/wiki/Amdahl%27s_law) says why. For
-speedup `S` on `n` threads with serial fraction `f`:
+Two input shapes were compared:
+
+- **Low-cardinality VARCHAR:** Velox dictionary-encoded input with cardinality
+  100. The values are about 12 bytes each, and the Parquet writer can encode
+  the repeated values compactly.
+- **Flat 128-byte VARCHAR:** deterministic, high-cardinality hexadecimal
+  strings. This case was intended to increase data-processing and compression
+  work. It was about 14.7x slower in the serial benchmark, but compressor time
+  and bytes passed to ZSTD were not measured separately, so we do not label it
+  compression-bound.
+
+## Results
+
+| Workers | Low-cardinality VARCHAR | Flat 128-byte VARCHAR |
+| ------: | ----------------------: | --------------------: |
+| 1       | 59.7 ms (1.00x)        | 877 ms (1.00x)        |
+| 2       | 56.8 ms (1.05x)        | 701 ms (1.25x)        |
+| 4       | 48.5 ms (1.23x)        | 607 ms (1.44x)        |
+| 8       | 39.1 ms (1.53x)        | 558 ms (1.57x)        |
+
+The flat workload benefits earlier: it reaches 1.25x at two workers, while the
+low-cardinality case reaches only 1.05x. At eight workers, however, the two are
+close at 1.57x and 1.53x. Both still improve between four and eight workers, so
+the accurate description is **diminishing returns through eight workers**, not
+a plateau at four.
+
+## Interpreting the curve with Amdahl's law
+
+For speedup `S` on `n` workers with a constant non-scaling fraction `f`, the
+idealized Amdahl model is:
 
 ```
 S = 1 / (f + (1 - f) / n)
 ```
 
-Plugging in `S = 1.57` at `n = 8`:
+Solving for `f` at each flat-workload point gives:
+
+| Workers | Measured speedup | Implied `f` |
+| ------: | ---------------: | ----------: |
+| 2       | 1.25x            | 60.0%       |
+| 4       | 1.44x            | 59.3%       |
+| 8       | 1.57x            | 58.5%       |
+
+The three reported point estimates yield numerically similar implied fractions,
+making the simple model a compact description of this workload's observed
+scaling. No run-to-run variance or confidence intervals were recorded, so this
+does not establish that the fraction is statistically stable. Using
+`f ≈ 0.59`, the model's asymptotic speedup is:
 
 ```
-1 / 1.57 = 0.637 = 0.875 f + 0.125   ⇒   f ≈ 0.585
+1 / f ≈ 1.7x
 ```
 
-So **~58% of column-write time is serial** — work `ParallelFor` cannot touch no
-matter the executor:
+That number needs careful interpretation. Here, `f` is an **effective
+non-scaling fraction for this benchmark**, not a direct measurement of code
+executing serially. It combines any work outside the parallel region with task
+submission and synchronization overhead, allocator or memory-system
+contention, imbalance among field tasks, and fixed benchmark-harness costs such
+as `MemorySink` allocation and input teardown. The one-worker and threaded
+cases also use different execution paths.
 
-- **row-group assembly into the single output stream** — columns encode in
-  parallel but must be serialized into one row group in order;
-- **definition-level computation** and per-column setup on the calling thread;
-- **shared memory-pool locking** across the concurrent column tasks;
-- **per-column load imbalance** — the row group can't finish until the slowest
-  column does.
+The benchmark did not profile those components separately. Source inspection
+identifies sequential setup and ordered row-group finalization, while task
+overhead, resource contention, memory-bandwidth limits, and field imbalance are
+plausible additional contributors. Determining their shares requires phase
+timing or profiling. The model therefore does not prove that every workload or
+future implementation has a hard 1.7x ceiling.
 
-With `f ≈ 0.58`, the ceiling is **~1.7x even with infinite threads**. The limit
-is the writer's structure, not the workload — which is why a 16x heavier
-compression load runs into the same wall.
+The low-cardinality curve is less consistent with a constant-fraction Amdahl
+model, which is another reason not to generalize the flat-workload estimate to
+the entire writer.
 
-## The decision
+## Why the feature did not land
 
-Weigh that against the cost to carry: a dedicated thread pool per writer,
-`~numColumns × perContext` extra scratch, pool spin-up that dominates small
-writes (it happens inside the write path), and the ongoing maintenance of a
-second, parallel write path. A bounded ~1.3-1.6x that plateaus by 4 threads does
-not justify that complexity, so the feature is **not landing**. The
-executor-owning design is kept on a branch in case the calculus changes.
+The best measured results were 1.53x and 1.57x at eight workers. Against those
+gains, enabling the existing Arrow parallel path in Velox would add a dedicated
+pool to every enabled writer, retain context buffers per top-level field, and
+create a configuration and execution mode that maintainers would need to
+support. Writer and pool construction were part of this one-shot benchmark,
+but the experiment did not isolate their individual cost.
 
-The durable result is the measurement itself: the Velox Parquet writer is
-fundamentally serial at ~58%, so parallel column encode/compress caps at ~1.7x.
-If you want materially faster Parquet writes, the gains are not in running the
-columns concurrently — they are in the serial section.
+Given that tradeoff, review feedback recommended not landing the option unless
+additional data changed the picture, and PR #18128 was closed accordingly. The
+executor-owning implementation remains on its fork branch if a different
+executor strategy, workload, or writer architecture changes the result later.
+
+The next useful step is not to assume a specific bottleneck, but to profile the
+writer by phase: export and setup, field tasks, task scheduling and waiting,
+row-group finalization, allocator behavior, and output copying. That would show
+whether reducing sequential work, amortizing executor setup, or changing the
+buffering architecture can move the curve.
 
 ## Takeaways
 
-- **Measure the feature, not the intuition.** "Independent columns, so it should
-  scale" is a hypothesis, not a result. End-to-end release numbers turned an
-  expected linear win into a bounded ~1.5x one.
-- **Pick the workload that should break your hypothesis.** The flat
-  high-entropy case existed specifically to give compression a chance to
-  dominate. It didn't — and that null result is the finding.
-- **Amdahl turns a speedup curve into a diagnosis.** Backing out `f ≈ 0.58` from
-  one 8-thread data point pointed straight at the serial section and set a hard
-  ~1.7x ceiling, before investing in more threads.
-- **A negative result is a contribution.** Knowing where the ceiling is — and
-  that it sits in row-group assembly, def-level computation, and pool locking —
-  points the next effort at the serial bottlenecks where the real gains are.
+- **Measure the complete lifecycle.** Independent column tasks provide useful
+  concurrency, but end-to-end gains also include setup, scheduling,
+  synchronization, finalization, and memory behavior.
+- **Use a heavier workload to challenge the result.** The 128-byte flat-string
+  case was much slower serially, yet its eight-worker speedup remained close to
+  the low-cardinality case. It did not, however, isolate compression as the
+  cause.
+- **Treat Amdahl's law as a model, not a profile.** A stable implied fraction
+  can describe a scaling curve and suggest an asymptote, but it cannot identify
+  the responsible code without additional measurements.
+- **Record negative results with their scope.** The experiment establishes what
+  happened for two workloads on one machine and explains why the option was not
+  landed. It also leaves clear questions for the next investigation instead of
+  presenting an extrapolation as an architectural fact.
 
 ## Acknowledgements
 
-Thanks to <a href="https://github.com/mbasmanova">Masha Basmanova</a> for
-pressing on the scaling and memory questions and for insisting the executor be
-owned by Velox rather than handed to Arrow's global pool — the review that
-turned a `bool` flag into a measurable, honest experiment. Thanks also to
-<a href="https://github.com/PingLiuPing">Ping Liu</a> and
-<a href="https://github.com/majetideepak">Deepak Majeti</a> for the reviews on
-the surrounding Parquet writer work.
+Thanks to [Masha Basmanova](https://github.com/mbasmanova) for pressing on the
+scaling and memory questions, recommending that Velox own the executor, and
+suggesting that the result be documented even though the feature did not land.
+Thanks to [Ping Liu](https://github.com/PingLiuPing) for recommending that
+parallel writing be evaluated independently from the dictionary-passthrough
+work.
