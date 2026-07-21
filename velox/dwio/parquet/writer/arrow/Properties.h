@@ -27,6 +27,7 @@
 #include "arrow/io/caching.h"
 #include "arrow/type.h"
 #include "arrow/util/type_fwd.h"
+#include "velox/dwio/parquet/writer/arrow/BenchmarkStats.h"
 #include "velox/dwio/parquet/writer/arrow/Encryption.h"
 #include "velox/dwio/parquet/writer/arrow/Exception.h"
 #include "velox/dwio/parquet/writer/arrow/Platform.h"
@@ -333,6 +334,13 @@ class PARQUET_EXPORT WriterProperties {
     /// Specify the memory pool for the writer. Default default_memory_pool.
     Builder* memoryPool(MemoryPool* pool) {
       pool_ = pool;
+      return this;
+    }
+
+    /// Installs optional benchmark counters.
+    Builder* benchmarkStats(
+        std::shared_ptr<WriterBenchmarkStats> benchmarkStats) {
+      benchmarkStats_ = std::move(benchmarkStats);
       return this;
     }
 
@@ -770,7 +778,8 @@ class PARQUET_EXPORT WriterProperties {
           columnProperties,
           dataPageVersion_,
           storeDecimalAsInteger_,
-          std::move(sortingColumns_)));
+          std::move(sortingColumns_),
+          std::move(benchmarkStats_)));
     }
 
    private:
@@ -799,10 +808,15 @@ class PARQUET_EXPORT WriterProperties {
     std::unordered_map<std::string, bool> dictionaryEnabled_;
     std::unordered_map<std::string, bool> statisticsEnabled_;
     std::unordered_map<std::string, bool> pageIndexEnabled_;
+    std::shared_ptr<WriterBenchmarkStats> benchmarkStats_;
   };
 
   inline MemoryPool* memoryPool() const {
     return pool_;
+  }
+
+  WriterBenchmarkStats* benchmarkStats() const {
+    return benchmarkStats_.get();
   }
 
   inline int64_t dictionaryPagesizeLimit() const {
@@ -947,7 +961,8 @@ class PARQUET_EXPORT WriterProperties {
       const std::unordered_map<std::string, ColumnProperties>& columnProperties,
       ParquetDataPageVersion dataPageVersion,
       bool storeShortDecimalAsInteger,
-      std::vector<SortingColumn> sortingColumns)
+      std::vector<SortingColumn> sortingColumns,
+      std::shared_ptr<WriterBenchmarkStats> benchmarkStats)
       : pool_(pool),
         dictionaryPagesizeLimit_(dictionaryPagesizeLimit),
         writeBatchSize_(writeBatchSize),
@@ -960,6 +975,7 @@ class PARQUET_EXPORT WriterProperties {
         pageChecksumEnabled_(pageWriteChecksumEnabled),
         fileEncryptionProperties_(std::move(fileEncryptionProperties)),
         sortingColumns_(std::move(sortingColumns)),
+        benchmarkStats_(std::move(benchmarkStats)),
         defaultColumnProperties_(defaultColumnProperties),
         columnProperties_(columnProperties) {}
 
@@ -977,6 +993,7 @@ class PARQUET_EXPORT WriterProperties {
   std::shared_ptr<FileEncryptionProperties> fileEncryptionProperties_;
 
   std::vector<SortingColumn> sortingColumns_;
+  std::shared_ptr<WriterBenchmarkStats> benchmarkStats_;
 
   ColumnProperties defaultColumnProperties_;
   std::unordered_map<std::string, ColumnProperties> columnProperties_;
@@ -1123,6 +1140,8 @@ class PARQUET_EXPORT ArrowWriterProperties {
           compliantNestedTypes_(true),
           engineVersion_(V2),
           useThreads_(kArrowDefaultUseThreads),
+          deferColumnWrites_(false),
+          usePerFieldWriteContexts_(false),
           executor_(NULLPTR) {}
     virtual ~Builder() = default;
 
@@ -1210,6 +1229,18 @@ class PARQUET_EXPORT ArrowWriterProperties {
       return this;
     }
 
+    /// Constructs all field writers before executing them serially.
+    Builder* setDeferColumnWrites(bool deferColumnWrites) {
+      deferColumnWrites_ = deferColumnWrites;
+      return this;
+    }
+
+    /// Gives deferred serial field writers independent write contexts.
+    Builder* setUsePerFieldWriteContexts(bool usePerFieldWriteContexts) {
+      usePerFieldWriteContexts_ = usePerFieldWriteContexts;
+      return this;
+    }
+
     /// \brief Set the executor to write columns in parallel in the
     /// buffered row group mode.
     ///
@@ -1230,6 +1261,8 @@ class PARQUET_EXPORT ArrowWriterProperties {
           compliantNestedTypes_,
           engineVersion_,
           useThreads_,
+          deferColumnWrites_,
+          usePerFieldWriteContexts_,
           executor_));
     }
 
@@ -1245,6 +1278,8 @@ class PARQUET_EXPORT ArrowWriterProperties {
     EngineVersion engineVersion_;
 
     bool useThreads_;
+    bool deferColumnWrites_;
+    bool usePerFieldWriteContexts_;
     ::arrow::internal::Executor* executor_;
   };
 
@@ -1290,6 +1325,14 @@ class PARQUET_EXPORT ArrowWriterProperties {
     return useThreads_;
   }
 
+  bool deferColumnWrites() const {
+    return deferColumnWrites_;
+  }
+
+  bool usePerFieldWriteContexts() const {
+    return usePerFieldWriteContexts_;
+  }
+
   /// \brief Returns the executor used to write columns in parallel.
   ::arrow::internal::Executor* executor() const;
 
@@ -1303,6 +1346,8 @@ class PARQUET_EXPORT ArrowWriterProperties {
       bool compliantNestedTypes,
       EngineVersion engineVersion,
       bool useThreads,
+      bool deferColumnWrites,
+      bool usePerFieldWriteContexts,
       ::arrow::internal::Executor* executor)
       : writeTimestampsAsInt96_(writeNanosAsInt96),
         coerceTimestampsEnabled_(coerceTimestampsEnabled),
@@ -1312,6 +1357,8 @@ class PARQUET_EXPORT ArrowWriterProperties {
         compliantNestedTypes_(compliantNestedTypes),
         engineVersion_(engineVersion),
         useThreads_(useThreads),
+        deferColumnWrites_(deferColumnWrites),
+        usePerFieldWriteContexts_(usePerFieldWriteContexts),
         executor_(executor) {}
 
   const bool writeTimestampsAsInt96_;
@@ -1322,6 +1369,8 @@ class PARQUET_EXPORT ArrowWriterProperties {
   const bool compliantNestedTypes_;
   const EngineVersion engineVersion_;
   const bool useThreads_;
+  const bool deferColumnWrites_;
+  const bool usePerFieldWriteContexts_;
   ::arrow::internal::Executor* executor_;
 };
 

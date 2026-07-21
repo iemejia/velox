@@ -17,6 +17,7 @@
 #include "velox/dwio/parquet/writer/Writer.h"
 
 #include <algorithm>
+#include <chrono>
 #include <exception>
 
 #include <arrow/c/bridge.h>
@@ -29,11 +30,22 @@
 #include "velox/common/testutil/TestValue.h"
 #include "velox/dwio/parquet/common/ParquetConfig.h"
 #include "velox/dwio/parquet/writer/arrow/ArrowSchema.h"
+#include "velox/dwio/parquet/writer/arrow/BenchmarkStats.h"
 #include "velox/dwio/parquet/writer/arrow/Properties.h"
 #include "velox/dwio/parquet/writer/arrow/Writer.h"
 #include "velox/exec/MemoryReclaimer.h"
 
 namespace facebook::velox::parquet {
+
+namespace {
+
+int64_t elapsedNanos(std::chrono::steady_clock::time_point start) {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now() - start)
+      .count();
+}
+
+} // namespace
 
 using facebook::velox::parquet::arrow::ArrowWriterProperties;
 using facebook::velox::parquet::arrow::Compression;
@@ -168,6 +180,7 @@ std::shared_ptr<WriterProperties> getArrowParquetWriterOptions(
     const ParquetWriterOptions& parquetOptions,
     const std::unique_ptr<DefaultFlushPolicy>& flushPolicy) {
   auto builder = WriterProperties::Builder();
+  builder.benchmarkStats(parquetOptions.benchmarkStats);
   WriterProperties::Builder* properties = &builder;
   if (parquetOptions.enableDictionary.value_or(
           facebook::velox::parquet::arrow::DEFAULT_IS_DICTIONARY_ENABLED)) {
@@ -444,7 +457,11 @@ Writer::Writer(
   writeInt96AsTimestamp_ = parquetWriterOptions.writeInt96AsTimestamp;
   columnWriteParallelism_ =
       std::max<int32_t>(parquetWriterOptions.columnWriteParallelism, 1);
-  if (columnWriteParallelism_ > 1) {
+  useDeferredSerialColumnWritePath_ =
+      parquetWriterOptions.useDeferredSerialColumnWritePath;
+  usePerFieldWriteContexts_ = parquetWriterOptions.usePerFieldWriteContexts;
+  if (columnWriteParallelism_ > 1 ||
+      parquetWriterOptions.useThreadedColumnWritePath) {
     PARQUET_ASSIGN_OR_THROW(
         columnWriteExecutor_,
         ::arrow::internal::ThreadPool::Make(columnWriteParallelism_));
@@ -493,8 +510,19 @@ void Writer::write(const VectorPtr& data) {
   }
 
   ArrowArray array;
+  auto* benchmarkStats = arrowContext_->properties->benchmarkStats();
+  const auto exportStart = benchmarkStats
+      ? std::chrono::steady_clock::now()
+      : std::chrono::steady_clock::time_point{};
   exportToArrow(exportData, array, generalPool_.get(), options_);
+  if (benchmarkStats) {
+    benchmarkStats->veloxExportNanos.fetch_add(
+        elapsedNanos(exportStart), std::memory_order_relaxed);
+  }
 
+  const auto schemaAndImportStart = benchmarkStats
+      ? std::chrono::steady_clock::now()
+      : std::chrono::steady_clock::time_point{};
   if (!arrowContext_->schema) {
     // First batch: export and fix up the Arrow schema, then cache it.
     ArrowSchema schema;
@@ -523,12 +551,19 @@ void Writer::write(const VectorPtr& data) {
   PARQUET_ASSIGN_OR_THROW(
       auto recordBatch,
       ::arrow::ImportRecordBatch(&array, arrowContext_->schema));
+  if (benchmarkStats) {
+    benchmarkStats->schemaAndImportNanos.fetch_add(
+        elapsedNanos(schemaAndImportStart), std::memory_order_relaxed);
+  }
 
   if (recordBatch->num_rows() == 0) {
     return;
   }
 
   if (!arrowContext_->writer) {
+    const auto writerOpenStart = benchmarkStats
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     ArrowWriterProperties::Builder builder;
     if (writeInt96AsTimestamp_) {
       builder.enableDeprecatedInt96Timestamps();
@@ -540,6 +575,8 @@ void Writer::write(const VectorPtr& data) {
       builder.setUseThreads(true);
       builder.setExecutor(columnWriteExecutor_.get());
     }
+    builder.setDeferColumnWrites(useDeferredSerialColumnWritePath_);
+    builder.setUsePerFieldWriteContexts(usePerFieldWriteContexts_);
     auto arrowProperties = builder.build();
     PARQUET_ASSIGN_OR_THROW(
         arrowContext_->writer,
@@ -549,10 +586,24 @@ void Writer::write(const VectorPtr& data) {
             stream_,
             arrowContext_->properties,
             arrowProperties));
+    if (benchmarkStats) {
+      benchmarkStats->arrowWriterOpenNanos.fetch_add(
+          elapsedNanos(writerOpenStart), std::memory_order_relaxed);
+    }
   }
 
+  const auto writeRecordBatchStart = benchmarkStats
+      ? std::chrono::steady_clock::now()
+      : std::chrono::steady_clock::time_point{};
   PARQUET_THROW_NOT_OK(arrowContext_->writer->writeRecordBatch(*recordBatch));
+  if (benchmarkStats) {
+    benchmarkStats->recordBatchWriteNanos.fetch_add(
+        elapsedNanos(writeRecordBatchStart), std::memory_order_relaxed);
+  }
 
+  const auto accountingStart = benchmarkStats
+      ? std::chrono::steady_clock::now()
+      : std::chrono::steady_clock::time_point{};
   // Flush as soon as the current write pushes the staged row group past the
   // policy threshold. Otherwise callers that rotate files based on raw written
   // bytes won't observe the row group until the next write.
@@ -564,6 +615,10 @@ void Writer::write(const VectorPtr& data) {
     // in the stream buffer when Arrow keeps starting new row groups before the
     // current one hits the byte threshold.
     PARQUET_THROW_NOT_OK(stream_->Flush());
+  }
+  if (benchmarkStats) {
+    benchmarkStats->postWriteAccountingNanos.fetch_add(
+        elapsedNanos(accountingStart), std::memory_order_relaxed);
   }
 }
 

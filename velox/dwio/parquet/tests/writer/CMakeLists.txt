@@ -65,4 +65,14 @@ if(VELOX_ENABLE_BENCHMARKS)
     Folly::follybenchmark
     Folly::folly
   )
+
+  add_executable(velox_parquet_parallel_write_benchmark ParquetParallelWriteBenchmark.cpp)
+  target_link_libraries(
+    velox_parquet_parallel_write_benchmark
+    velox_dwio_parquet_writer
+    velox_vector_test_lib
+    velox_link_libs
+    Folly::follybenchmark
+    Folly::folly
+  )
 endif()

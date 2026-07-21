@@ -27,6 +27,7 @@
 #include "velox/dwio/common/ParquetFieldId.h"
 #include "velox/dwio/common/Writer.h"
 #include "velox/dwio/common/WriterFactory.h"
+#include "velox/dwio/parquet/writer/arrow/BenchmarkStats.h"
 #include "velox/dwio/parquet/writer/arrow/Metadata.h"
 #include "velox/dwio/parquet/writer/arrow/Types.h"
 #include "velox/dwio/parquet/writer/arrow/util/Compression.h"
@@ -159,6 +160,21 @@ struct ParquetWriterOptions : public dwio::common::FormatSpecificOptions {
   /// (serial).
   int32_t columnWriteParallelism = 1;
 
+  /// Runs the threaded Arrow write path when columnWriteParallelism is 1.
+  /// Intended for benchmarks that isolate the fixed threaded-path overhead.
+  bool useThreadedColumnWritePath = false;
+
+  /// Constructs all field writers before executing them serially. Intended for
+  /// benchmarks that isolate field-writer ordering from executor overhead.
+  bool useDeferredSerialColumnWritePath = false;
+
+  /// Gives deferred serial field writers independent ArrowWriteContexts.
+  /// Intended for benchmarks that isolate context reuse from executor overhead.
+  bool usePerFieldWriteContexts = false;
+
+  /// Optional benchmark counters.
+  std::shared_ptr<arrow::WriterBenchmarkStats> benchmarkStats;
+
   std::shared_ptr<arrow::MemoryPool> arrowMemoryPool;
 
   /// Optional field IDs to assign to columns in the Parquet schema.
@@ -243,6 +259,12 @@ class Writer : public dwio::common::Writer {
 
   // Number of threads used for parallel column writing; 1 means serial.
   int32_t columnWriteParallelism_;
+
+  // Whether to defer all field writers before executing them serially.
+  bool useDeferredSerialColumnWritePath_;
+
+  // Whether deferred serial field writers use independent contexts.
+  bool usePerFieldWriteContexts_;
 
   // Dedicated Arrow thread pool for parallel column writing, created only when
   // columnWriteParallelism_ > 1. Owned by the writer and kept alive for the

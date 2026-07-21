@@ -18,6 +18,7 @@
 
 #include "velox/dwio/parquet/writer/arrow/FileWriter.h"
 
+#include <chrono>
 #include <memory>
 #include <ostream>
 #include <string>
@@ -27,6 +28,7 @@
 #include "arrow/util/key_value_metadata.h"
 
 #include "velox/common/base/Exceptions.h"
+#include "velox/dwio/parquet/writer/arrow/BenchmarkStats.h"
 #include "velox/dwio/parquet/writer/arrow/ColumnWriter.h"
 #include "velox/dwio/parquet/writer/arrow/EncryptionInternal.h"
 #include "velox/dwio/parquet/writer/arrow/Exception.h"
@@ -38,6 +40,16 @@
 using arrow::MemoryPool;
 
 namespace facebook::velox::parquet::arrow {
+
+namespace {
+
+int64_t elapsedNanos(std::chrono::steady_clock::time_point start) {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now() - start)
+      .count();
+}
+
+} // namespace
 
 using schema::GroupNode;
 
@@ -196,6 +208,7 @@ class RowGroupSerializer : public RowGroupWriter::Contents {
           properties_->pageChecksumEnabled(),
           ciBuilder,
           oiBuilder,
+          properties_->benchmarkStats(),
           CodecOptions());
     } else {
       pager = PageWriter::open(
@@ -211,6 +224,7 @@ class RowGroupSerializer : public RowGroupWriter::Contents {
           properties_->pageChecksumEnabled(),
           ciBuilder,
           oiBuilder,
+          properties_->benchmarkStats(),
           *codecOptions);
     }
     columnWriters_[0] =
@@ -293,6 +307,10 @@ class RowGroupSerializer : public RowGroupWriter::Contents {
 
   void close() override {
     if (!closed_) {
+      auto* stats = properties_->benchmarkStats();
+      const auto rowGroupCloseStart = stats
+          ? std::chrono::steady_clock::now()
+          : std::chrono::steady_clock::time_point{};
       closed_ = true;
       checkRowsWritten();
 
@@ -300,7 +318,14 @@ class RowGroupSerializer : public RowGroupWriter::Contents {
       auto columnWriters = std::move(columnWriters_);
       for (size_t i = 0; i < columnWriters.size(); i++) {
         if (columnWriters[i]) {
+          const auto columnCloseStart = stats
+              ? std::chrono::steady_clock::now()
+              : std::chrono::steady_clock::time_point{};
           totalBytesWritten_ += columnWriters[i]->close();
+          if (stats) {
+            stats->columnCloseNanos.fetch_add(
+                elapsedNanos(columnCloseStart), std::memory_order_relaxed);
+          }
           totalCompressedBytesWritten_ +=
               columnWriters[i]->totalCompressedBytesWritten();
         }
@@ -309,6 +334,10 @@ class RowGroupSerializer : public RowGroupWriter::Contents {
       // Ensures all columns have been written.
       metadata_->setNumRows(numRows_);
       metadata_->finish(totalBytesWritten_, rowGroupOrdinal_);
+      if (stats) {
+        stats->rowGroupCloseNanos.fetch_add(
+            elapsedNanos(rowGroupCloseStart), std::memory_order_relaxed);
+      }
     }
   }
 
@@ -384,6 +413,7 @@ class RowGroupSerializer : public RowGroupWriter::Contents {
             properties_->pageChecksumEnabled(),
             ciBuilder,
             oiBuilder,
+            properties_->benchmarkStats(),
             CodecOptions());
       } else {
         pager = PageWriter::open(
@@ -399,6 +429,7 @@ class RowGroupSerializer : public RowGroupWriter::Contents {
             properties_->pageChecksumEnabled(),
             ciBuilder,
             oiBuilder,
+            properties_->benchmarkStats(),
             *codecOptions);
       }
       columnWriters_.push_back(

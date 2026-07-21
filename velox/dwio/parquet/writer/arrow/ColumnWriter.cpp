@@ -20,6 +20,7 @@
 
 #include <glog/logging.h>
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -42,6 +43,7 @@
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/dwio/parquet/common/LevelConversion.h"
+#include "velox/dwio/parquet/writer/arrow/BenchmarkStats.h"
 #include "velox/dwio/parquet/writer/arrow/ColumnPage.h"
 #include "velox/dwio/parquet/writer/arrow/Encoding.h"
 #include "velox/dwio/parquet/writer/arrow/Encryption.h"
@@ -75,6 +77,16 @@ fmt::underlying_t<Type::type> formatAs(Type::type type) {
 }; // namespace arrow
 
 namespace facebook::velox::parquet::arrow {
+
+namespace {
+
+int64_t elapsedNanos(std::chrono::steady_clock::time_point start) {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now() - start)
+      .count();
+}
+
+} // namespace
 using util::CodecOptions;
 
 namespace {
@@ -291,6 +303,7 @@ class SerializedPageWriter : public PageWriter {
       std::shared_ptr<Encryptor> dataEncryptor = nullptr,
       ColumnIndexBuilder* columnIndexBuilder = nullptr,
       OffsetIndexBuilder* offsetIndexBuilder = nullptr,
+      WriterBenchmarkStats* benchmarkStats = nullptr,
       const CodecOptions& codecOptions = CodecOptions{})
       : sink_(std::move(sink)),
         metadata_(metadata),
@@ -308,7 +321,8 @@ class SerializedPageWriter : public PageWriter {
         dataEncryptor_(std::move(dataEncryptor)),
         encryptionBuffer_(allocateBuffer(pool, 0)),
         columnIndexBuilder_(columnIndexBuilder),
-        offsetIndexBuilder_(offsetIndexBuilder) {
+        offsetIndexBuilder_(offsetIndexBuilder),
+        benchmarkStats_(benchmarkStats) {
     if (dataEncryptor_ != nullptr || metaEncryptor_ != nullptr) {
       initEncryption();
     }
@@ -409,6 +423,10 @@ class SerializedPageWriter : public PageWriter {
    */
   void compress(const Buffer& srcBuffer, ResizableBuffer* destBuffer) override {
     VELOX_DCHECK_NOT_NULL(compressor_);
+    auto* stats = benchmarkStats_;
+    const auto compressionStart = stats
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
 
     // Compress the data.
     int64_t maxCompressedSize =
@@ -427,6 +445,14 @@ class SerializedPageWriter : public PageWriter {
             maxCompressedSize,
             destBuffer->mutable_data()));
     PARQUET_THROW_NOT_OK(destBuffer->Resize(compressedSize, false));
+    if (stats) {
+      stats->compressionNanos.fetch_add(
+          elapsedNanos(compressionStart), std::memory_order_relaxed);
+      stats->compressionInputBytes.fetch_add(
+          srcBuffer.size(), std::memory_order_relaxed);
+      stats->compressionOutputBytes.fetch_add(
+          compressedSize, std::memory_order_relaxed);
+    }
   }
 
   int64_t writeDataPage(const DataPage& page) override {
@@ -703,6 +729,7 @@ class SerializedPageWriter : public PageWriter {
 
   ColumnIndexBuilder* columnIndexBuilder_;
   OffsetIndexBuilder* offsetIndexBuilder_;
+  WriterBenchmarkStats* benchmarkStats_;
 };
 
 // This implementation of the PageWriter writes to the final sink on close.
@@ -720,10 +747,12 @@ class BufferedPageWriter : public PageWriter {
       std::shared_ptr<Encryptor> dataEncryptor = nullptr,
       ColumnIndexBuilder* columnIndexBuilder = nullptr,
       OffsetIndexBuilder* offsetIndexBuilder = nullptr,
+      WriterBenchmarkStats* benchmarkStats = nullptr,
       const CodecOptions& codecOptions = CodecOptions{})
       : finalSink_(std::move(sink)),
         metadata_(metadata),
-        hasDictionaryPages_(false) {
+        hasDictionaryPages_(false),
+        benchmarkStats_(benchmarkStats) {
     inMemorySink_ = createOutputStream(pool);
     pager_ = std::make_unique<SerializedPageWriter>(
         inMemorySink_,
@@ -737,6 +766,7 @@ class BufferedPageWriter : public PageWriter {
         std::move(dataEncryptor),
         columnIndexBuilder,
         offsetIndexBuilder,
+        benchmarkStats_,
         codecOptions);
   }
 
@@ -776,7 +806,16 @@ class BufferedPageWriter : public PageWriter {
 
     // Flush everything to the serialized sink.
     PARQUET_ASSIGN_OR_THROW(auto buffer, inMemorySink_->Finish());
+    auto* stats = benchmarkStats_;
+    const auto copyStart = stats ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
     PARQUET_THROW_NOT_OK(finalSink_->Write(buffer));
+    if (stats) {
+      stats->finalColumnCopyNanos.fetch_add(
+          elapsedNanos(copyStart), std::memory_order_relaxed);
+      stats->finalColumnCopyBytes.fetch_add(
+          buffer->size(), std::memory_order_relaxed);
+    }
   }
 
   int64_t writeDataPage(const DataPage& page) override {
@@ -801,6 +840,7 @@ class BufferedPageWriter : public PageWriter {
   std::shared_ptr<::arrow::io::BufferOutputStream> inMemorySink_;
   std::unique_ptr<SerializedPageWriter> pager_;
   bool hasDictionaryPages_;
+  WriterBenchmarkStats* benchmarkStats_;
 };
 
 std::unique_ptr<PageWriter> PageWriter::open(
@@ -816,6 +856,7 @@ std::unique_ptr<PageWriter> PageWriter::open(
     bool pageWriteChecksumEnabled,
     ColumnIndexBuilder* columnIndexBuilder,
     OffsetIndexBuilder* offsetIndexBuilder,
+    WriterBenchmarkStats* benchmarkStats,
     const CodecOptions& codecOptions) {
   if (bufferedRowGroup) {
     return std::unique_ptr<PageWriter>(new BufferedPageWriter(
@@ -830,6 +871,7 @@ std::unique_ptr<PageWriter> PageWriter::open(
         std::move(dataEncryptor),
         columnIndexBuilder,
         offsetIndexBuilder,
+        benchmarkStats,
         codecOptions));
   } else {
     return std::unique_ptr<PageWriter>(new SerializedPageWriter(
@@ -844,6 +886,7 @@ std::unique_ptr<PageWriter> PageWriter::open(
         std::move(dataEncryptor),
         columnIndexBuilder,
         offsetIndexBuilder,
+        benchmarkStats,
         codecOptions));
   }
 }
@@ -875,6 +918,7 @@ std::unique_ptr<PageWriter> PageWriter::open(
       pageWriteChecksumEnabled,
       columnIndexBuilder,
       offsetIndexBuilder,
+      nullptr,
       CodecOptions{compressionLevel});
 }
 // ----------------------------------------------------------------------.

@@ -19,6 +19,7 @@
 #include "velox/dwio/parquet/writer/arrow/Writer.h"
 
 #include <algorithm>
+#include <chrono>
 #include <deque>
 #include <memory>
 #include <string>
@@ -39,6 +40,7 @@
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/dwio/parquet/writer/arrow/ArrowSchema.h"
+#include "velox/dwio/parquet/writer/arrow/BenchmarkStats.h"
 #include "velox/dwio/parquet/writer/arrow/ColumnWriter.h"
 #include "velox/dwio/parquet/writer/arrow/Exception.h"
 #include "velox/dwio/parquet/writer/arrow/FileWriter.h"
@@ -70,6 +72,16 @@ using arrow::TimeUnit;
 using arrow::internal::checked_cast;
 
 namespace facebook::velox::parquet::arrow::arrow {
+
+namespace {
+
+int64_t elapsedNanos(std::chrono::steady_clock::time_point start) {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now() - start)
+      .count();
+}
+
+} // namespace
 
 using schema::GroupNode;
 
@@ -315,7 +327,8 @@ class FileWriterImpl : public FileWriter {
         columnWriteContext_(pool, arrowProperties.get()),
         arrowProperties_(std::move(arrowProperties)),
         closed_(false) {
-    if (arrowProperties_->useThreads()) {
+    if (arrowProperties_->useThreads() ||
+        arrowProperties_->usePerFieldWriteContexts()) {
       parallelColumnWriteContexts_.reserve(schema_->num_fields());
       for (int i = 0; i < schema_->num_fields(); ++i) {
         // Explicitly create each ArrowWriteContext object to avoid
@@ -462,6 +475,10 @@ class FileWriterImpl : public FileWriter {
       int columnIndexStart = 0;
 
       for (int i = 0; i < batch.num_columns(); i++) {
+        auto* stats = properties().benchmarkStats();
+        const auto fieldWriterSetupStart = stats
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         ChunkedArray chunkedArray{batch.column(i)};
         ARROW_ASSIGN_OR_RAISE(
             std::unique_ptr<ArrowColumnWriterV2> writer,
@@ -472,23 +489,73 @@ class FileWriterImpl : public FileWriter {
                 schemaManifest_,
                 rowGroupWriter_,
                 columnIndexStart));
+        if (stats) {
+          stats->fieldWriterSetupNanos.fetch_add(
+              elapsedNanos(fieldWriterSetupStart), std::memory_order_relaxed);
+        }
         columnIndexStart += writer->leafCount();
-        if (arrowProperties_->useThreads()) {
+        if (arrowProperties_->useThreads() ||
+            arrowProperties_->deferColumnWrites()) {
           writers.emplace_back(std::move(writer));
         } else {
-          RETURN_NOT_OK(writer->write(&columnWriteContext_));
+          const auto taskStart = stats
+              ? std::chrono::steady_clock::now()
+              : std::chrono::steady_clock::time_point{};
+          auto status = writer->write(&columnWriteContext_);
+          if (stats) {
+            stats->fieldTaskWallNanos.fetch_add(
+                elapsedNanos(taskStart), std::memory_order_relaxed);
+            stats->fieldTaskCount.fetch_add(1, std::memory_order_relaxed);
+          }
+          RETURN_NOT_OK(status);
         }
       }
 
       if (arrowProperties_->useThreads()) {
         VELOX_DCHECK_EQ(parallelColumnWriteContexts_.size(), writers.size());
+        auto* stats = properties().benchmarkStats();
+        const auto submitAndWaitStart = stats
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         RETURN_NOT_OK(
             ::arrow::internal::ParallelFor(
                 static_cast<int>(writers.size()),
                 [&](int i) {
-                  return writers[i]->write(&parallelColumnWriteContexts_[i]);
+                  const auto taskStart = stats
+                      ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
+                  auto status =
+                      writers[i]->write(&parallelColumnWriteContexts_[i]);
+                  if (stats) {
+                    stats->fieldTaskWallNanos.fetch_add(
+                        elapsedNanos(taskStart), std::memory_order_relaxed);
+                    stats->fieldTaskCount.fetch_add(
+                        1, std::memory_order_relaxed);
+                  }
+                  return status;
                 },
                 arrowProperties_->executor()));
+        if (stats) {
+          stats->taskSubmitAndWaitNanos.fetch_add(
+              elapsedNanos(submitAndWaitStart), std::memory_order_relaxed);
+        }
+      } else if (arrowProperties_->deferColumnWrites()) {
+        for (int i = 0; i < writers.size(); ++i) {
+          auto* stats = properties().benchmarkStats();
+          const auto taskStart = stats
+              ? std::chrono::steady_clock::now()
+              : std::chrono::steady_clock::time_point{};
+          auto* context = arrowProperties_->usePerFieldWriteContexts()
+              ? &parallelColumnWriteContexts_[i]
+              : &columnWriteContext_;
+          auto status = writers[i]->write(context);
+          if (stats) {
+            stats->fieldTaskWallNanos.fetch_add(
+                elapsedNanos(taskStart), std::memory_order_relaxed);
+            stats->fieldTaskCount.fetch_add(1, std::memory_order_relaxed);
+          }
+          RETURN_NOT_OK(status);
+        }
       }
 
       return Status::OK();

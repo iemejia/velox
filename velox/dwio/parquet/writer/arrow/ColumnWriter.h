@@ -39,6 +39,8 @@ class RleEncoder;
 
 namespace facebook::velox::parquet::arrow {
 
+struct WriterBenchmarkStats;
+
 namespace util {
 class CodecOptions;
 } // namespace util
@@ -111,6 +113,7 @@ class PARQUET_EXPORT PageWriter {
       ColumnIndexBuilder* columnIndexBuilder = NULLPTR,
       // offsetIndexBuilder must outlive the PageWriter.
       OffsetIndexBuilder* offsetIndexBuilder = NULLPTR,
+      WriterBenchmarkStats* benchmarkStats = nullptr,
       const util::CodecOptions& codecOptions = util::CodecOptions{});
 
   // TODO: remove this and port to new signature.

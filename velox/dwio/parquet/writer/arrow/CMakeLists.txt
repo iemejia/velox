@@ -43,6 +43,7 @@ velox_add_library(
   HEADERS
   ArrowSchema.h
   ArrowSchemaInternal.h
+  BenchmarkStats.h
   ColumnPage.h
   ColumnWriter.h
   Encoding.h
