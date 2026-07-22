@@ -91,16 +91,31 @@ Structural changes:
 
 ## Prioritized backlog
 
-**P0 — correctness fixes (port first, each with a failing test):**
+**P0 — correctness fixes (writer-applicable):**
 
-- Invalid Parquet written when dictionary-encoded pages are large — Arrow 23,
-  GH-47973. Touches `column_writer.cc` / encoding.
-- Pre-1970 INT96 timestamp round-trip — GH-48246. Cross-check against Velox's
-  existing INT96 negative-nanosecond handling; reconcile rather than duplicate.
-- Non-compliant RLE stream compatibility — GH-47981.
-- Overflow/UB hardening in column/offset index handling — GH-48146, GH-48308.
+- **[Done]** Invalid Parquet written when dictionary-encoded pages are large —
+  Arrow 23, GH-47973. Ported into `RleEncoder`, `LevelEncoder`, the dictionary
+  encoder, and `BitWriter` (int64 buffer-size math with `int32` guards).
+- **[Done]** Pre-1970 INT96 timestamp round-trip — GH-48246. Velox's writer
+  already borrows a day for negative intra-day remainders (commit `edfee872c`),
+  equivalent to the upstream fix. No production change; added the upstream
+  conversion vectors as a regression test that previously had no coverage.
 
-**P1 — statistics / index quality:**
+**Investigated — do not map to the vendored fork:**
+
+- Non-compliant RLE stream compatibility — GH-47981. The fix lives in Arrow's
+  rewritten `RleBitPackedParser`/`RleBitPackedDecoder`, which postdate Arrow 15.
+  Velox vendors the older `RleDecoder`. Its `GetBatchWithDictSpaced` is
+  structurally different — `DictionaryConverter` is a plain struct with no
+  validating constructor, and all-null blocks are filled without touching the
+  dictionary — so it is not exposed to the empty-dictionary crash the upstream
+  guard prevents. The truncation-tolerance change has no counterpart to port.
+- Column/offset index UB and crash-on-invalid-data — GH-48146, GH-48308. These
+  harden Arrow's page-index *reader*. Velox's production reader does not use the
+  page index (the vendored `PageIndexReader` is test-only), so there is no
+  production path to harden here.
+
+**P1 — statistics / index quality (writer-applicable):**
 
 - Size statistics (`size_statistics`) and page-index-on-by-default behavior
   (Arrow 20, GH-45227). Improves downstream reader pruning.
