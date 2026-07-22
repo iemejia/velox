@@ -224,7 +224,9 @@ inline bool BitWriter::PutValue(uint64_t v, int numBits) {
     VELOX_DCHECK_EQ(v >> numBits, 0, "v = {}, numBits = {}", v, numBits);
   }
 
-  if (FOLLY_UNLIKELY(byteOffset_ * 8 + bitOffset_ + numBits > maxBytes_ * 8))
+  if (FOLLY_UNLIKELY(
+          static_cast<int64_t>(byteOffset_) * 8 + bitOffset_ + numBits >
+          static_cast<int64_t>(maxBytes_) * 8))
     return false;
 
   bufferedValues_ |= v << bitOffset_;

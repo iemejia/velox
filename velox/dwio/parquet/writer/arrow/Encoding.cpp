@@ -467,7 +467,7 @@ struct DictEncoderTraits<FLBAType> {
 // Initially 1024 elements.
 static constexpr int32_t kInitialHashTableSize = 1 << 10;
 
-int rlePreserveBufferSize(int numValues, int bitWidth) {
+int64_t rlePreserveBufferSize(int64_t numValues, int bitWidth) {
   // Note: because of the way RleEncoder::CheckBufferFull()
   // is called, we have to Reserve an extra "RleEncoder::MinBufferSize"
   // bytes. These extra bytes won't be used but not reserving them
@@ -533,7 +533,7 @@ class DictEncoderImpl : public EncoderImpl, virtual public DictEncoder<DType> {
   int64_t estimatedDataEncodedSize() override {
     return kDataPageBitWidthBytes +
         rlePreserveBufferSize(
-               static_cast<int>(bufferedIndices_.size()), bitWidth());
+               static_cast<int64_t>(bufferedIndices_.size()), bitWidth());
   }
 
   /// The minimum bit width required to encode the currently buffered indices.
@@ -618,10 +618,17 @@ class DictEncoderImpl : public EncoderImpl, virtual public DictEncoder<DType> {
   }
 
   std::shared_ptr<::arrow::Buffer> flushValues() override {
+    const int64_t bufferSize = estimatedDataEncodedSize();
+    if (bufferSize > std::numeric_limits<int>::max()) {
+      throw ParquetException(
+          "Buffer size for DictEncoder (",
+          bufferSize,
+          ") exceeds maximum int value");
+    }
     std::shared_ptr<ResizableBuffer> buffer =
-        allocateBuffer(this->pool_, estimatedDataEncodedSize());
-    int resultSize = writeIndices(
-        buffer->mutable_data(), static_cast<int>(estimatedDataEncodedSize()));
+        allocateBuffer(this->pool_, bufferSize);
+    int resultSize =
+        writeIndices(buffer->mutable_data(), static_cast<int>(bufferSize));
     PARQUET_THROW_NOT_OK(buffer->Resize(resultSize, false));
     return std::move(buffer);
   }
@@ -3322,9 +3329,9 @@ class RleBooleanEncoder final : public EncoderImpl,
   template <typename SequenceType>
   void putImpl(const SequenceType& src, int numValues);
 
-  int maxRleBufferSize() const noexcept {
+  int64_t maxRleBufferSize() const noexcept {
     return rlePreserveBufferSize(
-        static_cast<int>(bufferedAppendValues_.size()), kBitWidth);
+        static_cast<int64_t>(bufferedAppendValues_.size()), kBitWidth);
   }
 
   constexpr static int32_t kBitWidth = 1;
@@ -3353,12 +3360,18 @@ void RleBooleanEncoder::putImpl(const SequenceType& src, int numValues) {
 }
 
 std::shared_ptr<Buffer> RleBooleanEncoder::flushValues() {
-  int rleBufferSizeMax = maxRleBufferSize();
+  int64_t rleBufferSizeMax = maxRleBufferSize();
+  if (rleBufferSizeMax > std::numeric_limits<int>::max()) {
+    throw ParquetException(
+        "Buffer size for RleBooleanEncoder (",
+        rleBufferSizeMax,
+        ") exceeds maximum int value");
+  }
   std::shared_ptr<ResizableBuffer> buffer =
       allocateBuffer(this->pool_, rleBufferSizeMax + kRleLengthInBytes);
   RleEncoder encoder(
       buffer->mutable_data() + kRleLengthInBytes,
-      rleBufferSizeMax,
+      static_cast<int>(rleBufferSizeMax),
       /*bit_width*/ kBitWidth);
 
   for (bool value : bufferedAppendValues_) {
