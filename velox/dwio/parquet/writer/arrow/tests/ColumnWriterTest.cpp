@@ -742,6 +742,39 @@ TYPED_TEST(TestPrimitiveWriter, dictionaryfallbackversion20) {
   this->testDictionaryFallbackEncoding(ParquetVersion::PARQUET_2_6);
 }
 
+// Round-trips nanoseconds to the Impala INT96 encoding and back, covering
+// pre-1970 timestamps where a naive modulo would produce a negative
+// intra-day remainder. Mirrors Apache Arrow's TestImpalaConversion
+// (apache/arrow GH-48246).
+TEST(TestImpalaConversion, arrowTimestampToImpalaTimestamp) {
+  const std::vector<std::pair<int64_t, Int96>> testCases = {
+      // June 20, 2017 16:32:56 and 123456789 nanoseconds.
+      {INT64_C(1497976376123456789),
+       {{UINT32_C(632093973), UINT32_C(13871), UINT32_C(2457925)}}},
+      // January 1, 1970 00:00:00 and 000000000 nanoseconds.
+      {INT64_C(0), {{UINT32_C(0), UINT32_C(0), UINT32_C(2440588)}}},
+      // December 31, 1969 23:59:59 and 999999000 nanoseconds.
+      {INT64_C(-1000),
+       {{UINT32_C(2437872664), UINT32_C(20116), UINT32_C(2440587)}}},
+      // December 31, 1969 00:00:00 and 000000000 nanoseconds.
+      {INT64_C(-86400000000000),
+       {{UINT32_C(0), UINT32_C(0), UINT32_C(2440587)}}},
+      // January 1, 1970 00:00:00 and 000001000 nanoseconds.
+      {INT64_C(1000), {{UINT32_C(1000), UINT32_C(0), UINT32_C(2440588)}}},
+      // January 2, 1970 00:00:00 and 000000000 nanoseconds.
+      {INT64_C(86400000000000),
+       {{UINT32_C(0), UINT32_C(0), UINT32_C(2440589)}}},
+  };
+
+  for (const auto& [timestamp, impalaTimestamp] : testCases) {
+    EXPECT_EQ(timestamp, int96GetNanoSeconds(impalaTimestamp));
+
+    Int96 calculated;
+    internal::nanosecondsToImpalaTimestamp(timestamp, &calculated);
+    EXPECT_EQ(impalaTimestamp, calculated);
+  }
+}
+
 TEST(TestWriter, NullValuesBuffer) {
   std::shared_ptr<::arrow::io::BufferOutputStream> sink = createOutputStream();
 
