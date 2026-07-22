@@ -23,8 +23,9 @@
 #include <string>
 #include <utility>
 
+#include "arrow/result.h"
+#include "arrow/status.h"
 #include "arrow/type_fwd.h"
-#include "arrow/util/string_builder.h"
 #include "velox/dwio/parquet/writer/arrow/Platform.h"
 
 // PARQUET-1085.
@@ -59,15 +60,15 @@
 
 // Arrow Status to Parquet exception.
 
-#define PARQUET_IGNORE_NOT_OK(s)                               \
-  do {                                                         \
-    ::arrow::Status S = ::arrow::internal::GenericToStatus(s); \
-    ARROW_UNUSED(S);                                           \
+#define PARQUET_IGNORE_NOT_OK(s)              \
+  do {                                        \
+    ::arrow::Status S = ::arrow::ToStatus(s); \
+    ARROW_UNUSED(S);                          \
   } while (0)
 
 #define PARQUET_THROW_NOT_OK(s)                                        \
   do {                                                                 \
-    ::arrow::Status S = ::arrow::internal::GenericToStatus(s);         \
+    ::arrow::Status S = ::arrow::ToStatus(s);                          \
     if (!S.ok()) {                                                     \
       throw ::facebook::velox::parquet::arrow::ParquetStatusException( \
           std::move(S));                                               \
@@ -85,6 +86,18 @@
 
 namespace facebook::velox::parquet::arrow {
 
+namespace detail {
+// Concatenates the streamed representation of all arguments into a string.
+// Replaces arrow::util::StringBuilder, which Apache Arrow removed after the
+// version this writer was adapted from.
+template <typename... Args>
+std::string stringBuilder(Args&&... args) {
+  std::ostringstream ss;
+  ((ss << std::forward<Args>(args)), ...);
+  return ss.str();
+}
+} // namespace detail
+
 class ParquetException : public std::exception {
  public:
   PARQUET_NORETURN static void eofException(const std::string& msg = "") {
@@ -101,7 +114,7 @@ class ParquetException : public std::exception {
 
   template <typename... Args>
   explicit ParquetException(Args&&... args)
-      : msg_(::arrow::util::StringBuilder(std::forward<Args>(args)...)) {}
+      : msg_(detail::stringBuilder(std::forward<Args>(args)...)) {}
 
   explicit ParquetException(std::string msg) : msg_(std::move(msg)) {}
 
