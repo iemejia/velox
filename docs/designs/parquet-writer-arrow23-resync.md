@@ -117,10 +117,25 @@ Structural changes:
 
 **P1 — statistics / index quality (writer-applicable):**
 
-- Size statistics (`size_statistics`) and page-index-on-by-default behavior
-  (Arrow 20, GH-45227). Improves downstream reader pruning.
-- Per-column `page_index_enabled` and `CopyColumnSpecificProperties`
-  (`properties.cc`).
+- **Already present.** Per-column `pageIndexEnabled`/`statisticsEnabled` live in
+  `Properties.h`, and the writer already builds and writes the page index
+  (`PageIndexBuilder`, `ColumnIndexBuilder`, `FileWriter::writePageIndex`). The
+  fork tracks Arrow past the point where these were added, so no port is needed.
+  `CopyColumnSpecificProperties` is a convenience method of marginal value.
+- **Size statistics — a dedicated PR.** The feature is entirely absent from the
+  fork (`parquet.thrift` has no `SizeStatistics`) and spans several files across
+  the FBThrift boundary. It cannot be landed as a small increment. Sub-plan:
+  1. `parquet.thrift`: add the `SizeStatistics` struct
+     (`unencoded_byte_array_data_bytes`, `repetition_level_histogram`,
+     `definition_level_histogram`) and its fields on `ColumnMetaData` and
+     `ColumnIndex`; regenerate via `add_fbthrift_cpp_library`.
+  2. Vendor `size_statistics.{h,cc}` as `SizeStatistics.{h,cpp}` (rehomed), with
+     `UpdateLevelHistogram` and an FBThrift `ThriftSizeStatistics` converter.
+  3. `ColumnWriter.cpp`: collect unencoded byte sizes and rep/def level
+     histograms during `WriteBatch`; thread a `SizeStatisticsLevel` option
+     (`NONE`/`COLUMN_CHUNK`/`PAGE`) through `Properties`.
+  4. `Metadata.cpp` / `PageIndex.cpp`: serialize/merge size statistics.
+  5. Tests for round-trip and per-level behavior.
 
 **P2 — features (larger, optional):**
 
