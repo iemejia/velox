@@ -193,7 +193,7 @@ class RleEncoder {
       : bitWidth_(bitWidth), bitWriter_(buffer, bufferLen) {
     VELOX_DCHECK_GE(bitWidth_, 0);
     VELOX_DCHECK_LE(bitWidth_, 64);
-    maxRunByteSize_ = MinBufferSize(bitWidth);
+    maxRunByteSize_ = static_cast<int>(MinBufferSize(bitWidth));
     VELOX_DCHECK_GE(bufferLen, maxRunByteSize_, "Input buffer not big enough.");
     Clear();
   }
@@ -201,32 +201,30 @@ class RleEncoder {
   /// Returns the minimum buffer size needed to use the encoder for 'bitWidth'
   /// This is the maximum length of a single run for 'bitWidth'.
   /// It is not valid to pass a buffer less than this length.
-  static int MinBufferSize(int bitWidth) {
+  static int64_t MinBufferSize(int bitWidth) {
     /// 1 indicator byte and MAX_VALUES_PER_LITERAL_RUN 'bitWidth' values.
-    int maxLiteralRunSize = 1 +
-        static_cast<int>(::arrow::bit_util::BytesForBits(
-            MAX_VALUES_PER_LITERAL_RUN * bitWidth));
+    int64_t maxLiteralRunSize = 1 +
+        ::arrow::bit_util::BytesForBits(MAX_VALUES_PER_LITERAL_RUN * bitWidth);
     /// Up to kMaxVlqByteLength indicator and a single 'bitWidth' value.
-    int maxRepeatedRunSize = BitReader::kMaxVlqByteLength +
-        static_cast<int>(::arrow::bit_util::BytesForBits(bitWidth));
+    int64_t maxRepeatedRunSize = BitReader::kMaxVlqByteLength +
+        ::arrow::bit_util::BytesForBits(bitWidth);
     return std::max(maxLiteralRunSize, maxRepeatedRunSize);
   }
 
   /// Returns the maximum byte size it could take to encode 'numValues'.
-  static int MaxBufferSize(int bitWidth, int numValues) {
+  static int64_t MaxBufferSize(int bitWidth, int64_t numValues) {
     // For a bitWidth > 1, the worst case is the repetition of "literal run of
     // length 8 and then a repeated run of length 8". 8 values per smallest run,
     // 8 bits per byte
-    int bytesPerRun = bitWidth;
-    int numRuns = static_cast<int>(::arrow::bit_util::CeilDiv(numValues, 8));
-    int literalMaxSize = numRuns + numRuns * bytesPerRun;
+    int64_t bytesPerRun = bitWidth;
+    int64_t numRuns = ::arrow::bit_util::CeilDiv(numValues, 8);
+    int64_t literalMaxSize = numRuns + numRuns * bytesPerRun;
 
     // In the very worst case scenario, the data is a concatenation of repeated
     // runs of 8 values. Repeated run has a 1 byte varint followed by the
     // bit-packed repeated value
-    int minRepeatedRunSize =
-        1 + static_cast<int>(::arrow::bit_util::BytesForBits(bitWidth));
-    int repeatedMaxSize = numRuns * minRepeatedRunSize;
+    int64_t minRepeatedRunSize = 1 + ::arrow::bit_util::BytesForBits(bitWidth);
+    int64_t repeatedMaxSize = numRuns * minRepeatedRunSize;
 
     return std::max(literalMaxSize, repeatedMaxSize);
   }
@@ -874,7 +872,7 @@ inline int RleEncoder::Flush() {
 }
 
 inline void RleEncoder::CheckBufferFull() {
-  int bytesWritten = bitWriter_.bytesWritten();
+  int64_t bytesWritten = bitWriter_.bytesWritten();
   if (bytesWritten + maxRunByteSize_ > bitWriter_.bufferLen()) {
     bufferFull_ = true;
   }

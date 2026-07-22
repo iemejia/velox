@@ -224,7 +224,9 @@ inline bool BitWriter::PutValue(uint64_t v, int numBits) {
     VELOX_DCHECK_EQ(v >> numBits, 0, "v = {}, numBits = {}", v, numBits);
   }
 
-  if (FOLLY_UNLIKELY(byteOffset_ * 8 + bitOffset_ + numBits > maxBytes_ * 8))
+  if (FOLLY_UNLIKELY(
+          static_cast<int64_t>(byteOffset_) * 8 + bitOffset_ + numBits >
+          static_cast<int64_t>(maxBytes_) * 8))
     return false;
 
   bufferedValues_ |= v << bitOffset_;
@@ -355,12 +357,12 @@ inline int BitReader::GetBatch(int numBits, T* v, int batchSize) {
 
   // The batched bit-unpacker (velox::dwio::common::unpack) requires the number
   // of values to be a multiple of 8; the remainder is handled by the per-value
-  // GetValue_ loop below. Byte offsets are advanced by the exact number of bytes
-  // the unpacker consumed, tracked via the by-reference input pointer.
+  // GetValue_ loop below. Byte offsets are advanced by the exact number of
+  // bytes the unpacker consumed, tracked via the by-reference input pointer.
   //
   // The batched unpacker only supports bit widths up to 32. For numBits > 32
-  // (only possible when sizeof(T) == 8) there is no fast path and all values are
-  // decoded by the per-value GetValue_ loop below.
+  // (only possible when sizeof(T) == 8) there is no fast path and all values
+  // are decoded by the per-value GetValue_ loop below.
   if (sizeof(T) == 4) {
     int toUnpack = (batchSize - i) / 8 * 8;
     const uint8_t* in = buffer + byteOffset;
@@ -371,7 +373,8 @@ inline int BitReader::GetBatch(int numBits, T* v, int batchSize) {
     i += toUnpack;
     byteOffset += static_cast<int>(in - inStart);
   } else if (numBits <= 32) {
-    // sizeof(T) != 4 with numBits <= 32: unpack through a 32-bit staging buffer.
+    // sizeof(T) != 4 with numBits <= 32: unpack through a 32-bit staging
+    // buffer.
     const int bufferSize = 1024;
     uint32_t unpackBuffer[bufferSize];
     while (i < batchSize) {
