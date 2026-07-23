@@ -48,6 +48,7 @@
 #include "velox/dwio/parquet/writer/arrow/EncryptionInternal.h"
 #include "velox/dwio/parquet/writer/arrow/FileEncryptorInternal.h"
 #include "velox/dwio/parquet/writer/arrow/Metadata.h"
+#include "velox/dwio/parquet/writer/arrow/SizeStatistics.h"
 #include "velox/dwio/parquet/writer/arrow/PageIndex.h"
 #include "velox/dwio/parquet/writer/arrow/Platform.h"
 #include "velox/dwio/parquet/writer/arrow/Properties.h"
@@ -929,6 +930,15 @@ class ColumnWriterImpl {
       compressorTempBuffer_ = std::static_pointer_cast<ResizableBuffer>(
           allocateBuffer(allocator_, 0));
     }
+
+    if (properties_->sizeStatisticsLevel() ==
+        SizeStatisticsLevel::kColumnChunk) {
+      chunkSizeStatistics_ = SizeStatistics::make(descr_);
+      // TODO: collect unencoded BYTE_ARRAY data bytes. Until then only the
+      // level histograms are populated, so drop the byte-count field rather
+      // than write an incorrect zero.
+      chunkSizeStatistics_->unencodedByteArrayDataBytes.reset();
+    }
   }
 
   virtual ~ColumnWriterImpl() = default;
@@ -976,6 +986,15 @@ class ColumnWriterImpl {
     VELOX_DCHECK(!closed_);
     PARQUET_THROW_NOT_OK(
         definitionLevelsSink_.Append(levels, sizeof(int16_t) * numLevels));
+    if (chunkSizeStatistics_ &&
+        !chunkSizeStatistics_->definitionLevelHistogram.empty()) {
+      updateLevelHistogram(
+          levels,
+          numLevels,
+          chunkSizeStatistics_->definitionLevelHistogram.data(),
+          static_cast<int64_t>(
+              chunkSizeStatistics_->definitionLevelHistogram.size()));
+    }
   }
 
   // Write multiple repetition levels.
@@ -983,6 +1002,15 @@ class ColumnWriterImpl {
     VELOX_DCHECK(!closed_);
     PARQUET_THROW_NOT_OK(
         repetitionLevelsSink_.Append(levels, sizeof(int16_t) * numLevels));
+    if (chunkSizeStatistics_ &&
+        !chunkSizeStatistics_->repetitionLevelHistogram.empty()) {
+      updateLevelHistogram(
+          levels,
+          numLevels,
+          chunkSizeStatistics_->repetitionLevelHistogram.data(),
+          static_cast<int64_t>(
+              chunkSizeStatistics_->repetitionLevelHistogram.size()));
+    }
   }
 
   // RLE encode the src_buffer into dest_buffer and return the encoded size.
@@ -1044,6 +1072,10 @@ class ColumnWriterImpl {
 
   // Flag to infer if dictionary encoding has fallen back to PLAIN.
   bool fallback_;
+
+  // Accumulated size statistics for the whole column chunk, or null when size
+  // statistics collection is disabled.
+  std::unique_ptr<SizeStatistics> chunkSizeStatistics_;
 
   ::arrow::BufferBuilder definitionLevelsSink_;
   ::arrow::BufferBuilder repetitionLevelsSink_;
@@ -1327,6 +1359,10 @@ int64_t ColumnWriterImpl::close() {
     // Write stats only if the column has at least one row written.
     if (rowsWritten_ > 0 && chunkStatistics.isSet()) {
       metadata_->setStatistics(chunkStatistics);
+    }
+    if (rowsWritten_ > 0 && chunkSizeStatistics_ &&
+        chunkSizeStatistics_->isSet()) {
+      metadata_->setSizeStatistics(*chunkSizeStatistics_);
     }
     pager_->close(hasDictionary_, fallback_);
   }
