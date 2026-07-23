@@ -100,6 +100,14 @@ struct ParquetVersion {
 /// DataPageV2 at all.
 enum class ParquetDataPageVersion { V1, V2 };
 
+/// Controls the granularity at which size statistics are collected and written.
+enum class SizeStatisticsLevel : uint8_t {
+  /// No size statistics are collected.
+  kNone = 0,
+  /// Size statistics are collected for the whole column chunk.
+  kColumnChunk = 1,
+};
+
 /// Align the default buffer size to a small multiple of a page size.
 constexpr int64_t kDefaultBufferSize = 4096 * 4;
 
@@ -218,6 +226,8 @@ static const char DEFAULT_CREATED_BY[] = CREATED_BY_VERSION;
 static constexpr Compression::type DEFAULT_COMPRESSION_TYPE =
     Compression::UNCOMPRESSED;
 static constexpr bool DEFAULT_IS_PAGE_INDEX_ENABLED = false;
+static constexpr SizeStatisticsLevel DEFAULT_SIZE_STATISTICS_LEVEL =
+    SizeStatisticsLevel::kNone;
 
 class PARQUET_EXPORT ColumnProperties {
  public:
@@ -324,6 +334,7 @@ class PARQUET_EXPORT WriterProperties {
           pagesize_(kDefaultDataPageSize),
           version_(ParquetVersion::PARQUET_2_6),
           dataPageVersion_(ParquetDataPageVersion::V1),
+          sizeStatisticsLevel_(DEFAULT_SIZE_STATISTICS_LEVEL),
           createdBy_(
               DEFAULT_CREATED_BY + std::string(" version ") + VELOX_VERSION),
           storeDecimalAsInteger_(false),
@@ -406,6 +417,13 @@ class PARQUET_EXPORT WriterProperties {
     /// Default V1.
     Builder* dataPageVersion(ParquetDataPageVersion dataPageVersion) {
       dataPageVersion_ = dataPageVersion;
+      return this;
+    }
+
+    /// Sets the granularity at which size statistics are collected. Defaults to
+    /// SizeStatisticsLevel::kNone.
+    Builder* sizeStatisticsLevel(SizeStatisticsLevel level) {
+      sizeStatisticsLevel_ = level;
       return this;
     }
 
@@ -770,7 +788,8 @@ class PARQUET_EXPORT WriterProperties {
           columnProperties,
           dataPageVersion_,
           storeDecimalAsInteger_,
-          std::move(sortingColumns_)));
+          std::move(sortingColumns_),
+          sizeStatisticsLevel_));
     }
 
    private:
@@ -781,6 +800,7 @@ class PARQUET_EXPORT WriterProperties {
     int64_t pagesize_;
     ParquetVersion::type version_;
     ParquetDataPageVersion dataPageVersion_;
+    SizeStatisticsLevel sizeStatisticsLevel_;
     std::string createdBy_;
     bool storeDecimalAsInteger_;
     bool pageChecksumEnabled_;
@@ -932,6 +952,11 @@ class PARQUET_EXPORT WriterProperties {
     }
   }
 
+  /// Returns the granularity at which size statistics are collected.
+  inline SizeStatisticsLevel sizeStatisticsLevel() const {
+    return sizeStatisticsLevel_;
+  }
+
  private:
   explicit WriterProperties(
       MemoryPool* pool,
@@ -947,7 +972,8 @@ class PARQUET_EXPORT WriterProperties {
       const std::unordered_map<std::string, ColumnProperties>& columnProperties,
       ParquetDataPageVersion dataPageVersion,
       bool storeShortDecimalAsInteger,
-      std::vector<SortingColumn> sortingColumns)
+      std::vector<SortingColumn> sortingColumns,
+      SizeStatisticsLevel sizeStatisticsLevel)
       : pool_(pool),
         dictionaryPagesizeLimit_(dictionaryPagesizeLimit),
         writeBatchSize_(writeBatchSize),
@@ -961,7 +987,8 @@ class PARQUET_EXPORT WriterProperties {
         fileEncryptionProperties_(std::move(fileEncryptionProperties)),
         sortingColumns_(std::move(sortingColumns)),
         defaultColumnProperties_(defaultColumnProperties),
-        columnProperties_(columnProperties) {}
+        columnProperties_(columnProperties),
+        sizeStatisticsLevel_(sizeStatisticsLevel) {}
 
   MemoryPool* pool_;
   int64_t dictionaryPagesizeLimit_;
@@ -980,6 +1007,7 @@ class PARQUET_EXPORT WriterProperties {
 
   ColumnProperties defaultColumnProperties_;
   std::unordered_map<std::string, ColumnProperties> columnProperties_;
+  SizeStatisticsLevel sizeStatisticsLevel_;
 };
 
 PARQUET_EXPORT const std::shared_ptr<WriterProperties>&
