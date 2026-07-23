@@ -288,6 +288,39 @@ TEST(PageIndex, WriteOffsetIndex) {
   }
 }
 
+// Appends per-page unencoded BYTE_ARRAY byte counts to the offset index.
+TEST(PageIndex, WriteOffsetIndexWithUnencodedByteArrayDataBytes) {
+  auto builder = OffsetIndexBuilder::make();
+  const std::vector<int64_t> offsets = {100, 200, 300};
+  const std::vector<int32_t> pageSizes = {1024, 2048, 3072};
+  const std::vector<int64_t> firstRowIndices = {0, 100, 200};
+  const std::vector<int64_t> unencodedBytes = {50, 70, 90};
+  for (size_t i = 0; i < offsets.size(); ++i) {
+    builder->addPage(
+        offsets[i], pageSizes[i], firstRowIndices[i], unencodedBytes[i]);
+  }
+  builder->finish(/*finalPosition=*/0);
+
+  auto sink = createOutputStream();
+  builder->writeTo(sink.get());
+  PARQUET_ASSIGN_OR_THROW(auto buffer, sink->Finish());
+
+  ::facebook::velox::parquet::thrift::OffsetIndex thriftOffsetIndex;
+  ::facebook::velox::parquet::thrift::deserialize(
+      &thriftOffsetIndex,
+      std::string_view(
+          reinterpret_cast<const char*>(buffer->data()), buffer->size()));
+
+  ASSERT_TRUE(
+      thriftOffsetIndex.unencoded_byte_array_data_bytes().has_value());
+  const auto& bytes =
+      thriftOffsetIndex.unencoded_byte_array_data_bytes().value();
+  ASSERT_EQ(bytes.size(), 3u);
+  EXPECT_EQ(bytes[0], 50);
+  EXPECT_EQ(bytes[1], 70);
+  EXPECT_EQ(bytes[2], 90);
+}
+
 void testWriteTypedColumnIndex(
     schema::NodePtr Node,
     const std::vector<EncodedStatistics>& pageStats,

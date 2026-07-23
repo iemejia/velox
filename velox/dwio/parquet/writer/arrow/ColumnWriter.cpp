@@ -503,7 +503,8 @@ class SerializedPageWriter : public PageWriter {
       offsetIndexBuilder_->addPage(
           startPos,
           static_cast<int32_t>(compressedSize),
-          *page.firstRowIndex());
+          *page.firstRowIndex(),
+          page.sizeStatistics().unencodedByteArrayDataBytes);
     }
 
     totalUncompressedSize_ += uncompressedSize + headerSize;
