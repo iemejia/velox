@@ -122,20 +122,26 @@ Structural changes:
   (`PageIndexBuilder`, `ColumnIndexBuilder`, `FileWriter::writePageIndex`). The
   fork tracks Arrow past the point where these were added, so no port is needed.
   `CopyColumnSpecificProperties` is a convenience method of marginal value.
-- **Size statistics — a dedicated PR.** The feature is entirely absent from the
-  fork (`parquet.thrift` has no `SizeStatistics`) and spans several files across
-  the FBThrift boundary. It cannot be landed as a small increment. Sub-plan:
-  1. `parquet.thrift`: add the `SizeStatistics` struct
-     (`unencoded_byte_array_data_bytes`, `repetition_level_histogram`,
-     `definition_level_histogram`) and its fields on `ColumnMetaData` and
-     `ColumnIndex`; regenerate via `add_fbthrift_cpp_library`.
-  2. Vendor `size_statistics.{h,cc}` as `SizeStatistics.{h,cpp}` (rehomed), with
-     `UpdateLevelHistogram` and an FBThrift `ThriftSizeStatistics` converter.
-  3. `ColumnWriter.cpp`: collect unencoded byte sizes and rep/def level
-     histograms during `WriteBatch`; thread a `SizeStatisticsLevel` option
-     (`NONE`/`COLUMN_CHUNK`/`PAGE`) through `Properties`.
-  4. `Metadata.cpp` / `PageIndex.cpp`: serialize/merge size statistics.
-  5. Tests for round-trip and per-level behavior.
+- **Size statistics — a dedicated PR (in progress).** The feature is absent from
+  the fork and spans several files across the FBThrift boundary. It is being
+  landed incrementally:
+  1. **[Done]** `parquet.thrift`: `SizeStatistics` struct and
+     `ColumnMetaData.size_statistics` (id 16); regenerated via FBThrift.
+  2. **[Done]** Vendored `SizeStatistics.{h,cpp}` (rehomed) with level-histogram
+     and unencoded-byte accounting, plus a `SizeStatisticsLevel` writer property
+     defaulting to `kNone` (no behavior change).
+  3. **[Remaining]** `ColumnWriter.cpp`: hold a per-chunk `SizeStatistics`
+     (`SizeStatistics::make(descr_)` when the level is `kColumnChunk`), call
+     `updateLevelHistogram` over the def/rep levels as batches are written, and
+     for BYTE_ARRAY columns increment `unencodedByteArrayDataBytes`. Set it on
+     the column metadata in `close()`.
+  4. **[Remaining]** `Metadata.cpp`: add
+     `ColumnChunkMetaDataBuilder::setSizeStatistics` mirroring `setStatistics`
+     (assign the FBThrift `size_statistics` field), and a
+     `ColumnChunkMetaData::sizeStatistics()` reader.
+  5. **[Remaining]** Test: write with `kColumnChunk`, read the metadata back,
+     and assert the histograms and unencoded byte count. Consider page-level
+     (`ColumnIndex`) support and flipping the default in a later change.
 
 **P2 — features (larger, optional):**
 
