@@ -931,8 +931,7 @@ class ColumnWriterImpl {
           allocateBuffer(allocator_, 0));
     }
 
-    if (properties_->sizeStatisticsLevel() ==
-        SizeStatisticsLevel::kColumnChunk) {
+    if (properties_->sizeStatisticsLevel() != SizeStatisticsLevel::kNone) {
       chunkSizeStatistics_ = SizeStatistics::make(descr_);
     }
   }

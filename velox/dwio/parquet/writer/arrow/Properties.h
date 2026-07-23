@@ -106,6 +106,8 @@ enum class SizeStatisticsLevel : uint8_t {
   kNone = 0,
   /// Size statistics are collected for the whole column chunk.
   kColumnChunk = 1,
+  /// Size statistics are collected for each page and the whole column chunk.
+  kPageAndColumnChunk = 2,
 };
 
 /// Align the default buffer size to a small multiple of a page size.

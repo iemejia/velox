@@ -1010,6 +1010,21 @@ struct ColumnIndex {
 
   /** A list containing the number of null values for each page **/
   5: optional list<i64> null_counts;
+
+  /**
+   * Contains repetition level histograms for each page concatenated together.
+   * The repetition_level_histogram field on SizeStatistics contains more
+   * details. When present the length should always be
+   * (number of pages * (max_repetition_level + 1)).
+   */
+  6: optional list<i64> repetition_level_histograms;
+
+  /**
+   * Same as repetition_level_histograms except for definition levels. When
+   * present the length should always be
+   * (number of pages * (max_definition_level + 1)).
+   */
+  7: optional list<i64> definition_level_histograms;
 }
 
 struct AesGcmV1 {
