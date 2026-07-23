@@ -139,9 +139,18 @@ Structural changes:
      `ColumnChunkMetaData::sizeStatistics()` reads it back.
   5. **[Done]** Test: writes an optional column with `kColumnChunk` and asserts
      the definition level histogram round-trips for every primitive type.
-  6. **[Remaining]** Unencoded BYTE_ARRAY byte accounting (currently suppressed
-     rather than written as an incorrect zero), page-level (`ColumnIndex`)
-     support, and flipping the default.
+  6. **[Done]** Unencoded BYTE_ARRAY byte accounting: the writer sums the
+     unencoded value lengths (packed and spaced paths) into
+     `unencodedByteArrayDataBytes`, verified by a round-trip test.
+  7. **[Remaining]** Page-level size statistics. This is a separate, larger
+     change and is lower value for Velox specifically, since the production
+     reader does not consume the page index. It needs: `ColumnIndex` Thrift
+     fields (`repetition_level_histograms`, `definition_level_histograms`,
+     `unencoded_byte_array_data_bytes`); a `kPageAndColumnChunk` level; per-page
+     `SizeStatistics` in `ColumnWriter` merged into the chunk on page flush and
+     handed to the column index builder; and `PageIndex.cpp` accumulation of the
+     concatenated per-page histograms. Flipping the default level to match
+     upstream is a behavior change and should ship with that work.
 
 **P2 — features (larger, optional):**
 
