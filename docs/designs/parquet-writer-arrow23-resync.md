@@ -148,9 +148,13 @@ Structural changes:
      `ColumnIndexBuilder::addPage`, which concatenates the definition and
      repetition level histograms into the `ColumnIndex`. Verified by a builder
      test that checks the serialized concatenation order.
-  8. **[Remaining]** Unencoded per-page bytes belong in `OffsetIndex` (field 2),
-     a further small step. Flipping the default level to match upstream is a
-     behavior change and should ship on its own with broad test validation.
+  8. **[Done]** Unencoded per-page bytes are written to the `OffsetIndex`
+     (`unencoded_byte_array_data_bytes`, id 2). Size statistics now cover the
+     full parquet-format surface: column-chunk histograms and unencoded bytes,
+     and page-level histograms (column index) and unencoded bytes (offset
+     index).
+  9. **[Remaining]** Flipping the default level to match upstream is a behavior
+     change and should ship on its own with broad test validation.
 
 **P2 — features (larger, optional):**
 
