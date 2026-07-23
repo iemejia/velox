@@ -48,11 +48,11 @@
 #include "velox/dwio/parquet/writer/arrow/EncryptionInternal.h"
 #include "velox/dwio/parquet/writer/arrow/FileEncryptorInternal.h"
 #include "velox/dwio/parquet/writer/arrow/Metadata.h"
-#include "velox/dwio/parquet/writer/arrow/SizeStatistics.h"
 #include "velox/dwio/parquet/writer/arrow/PageIndex.h"
 #include "velox/dwio/parquet/writer/arrow/Platform.h"
 #include "velox/dwio/parquet/writer/arrow/Properties.h"
 #include "velox/dwio/parquet/writer/arrow/Schema.h"
+#include "velox/dwio/parquet/writer/arrow/SizeStatistics.h"
 #include "velox/dwio/parquet/writer/arrow/Statistics.h"
 #include "velox/dwio/parquet/writer/arrow/ThriftInternal.h"
 #include "velox/dwio/parquet/writer/arrow/Types.h"
@@ -503,7 +503,8 @@ class SerializedPageWriter : public PageWriter {
       offsetIndexBuilder_->addPage(
           startPos,
           static_cast<int32_t>(compressedSize),
-          *page.firstRowIndex());
+          *page.firstRowIndex(),
+          page.sizeStatistics().unencodedByteArrayDataBytes);
     }
 
     totalUncompressedSize_ += uncompressedSize + headerSize;
@@ -1011,7 +1012,8 @@ class ColumnWriterImpl {
     VELOX_DCHECK(!closed_);
     PARQUET_THROW_NOT_OK(
         definitionLevelsSink_.Append(levels, sizeof(int16_t) * numLevels));
-    accumulateDefinitionHistogram(chunkSizeStatistics_.get(), numLevels, levels);
+    accumulateDefinitionHistogram(
+        chunkSizeStatistics_.get(), numLevels, levels);
     accumulateDefinitionHistogram(pageSizeStatistics_.get(), numLevels, levels);
   }
 
@@ -1020,7 +1022,8 @@ class ColumnWriterImpl {
     VELOX_DCHECK(!closed_);
     PARQUET_THROW_NOT_OK(
         repetitionLevelsSink_.Append(levels, sizeof(int16_t) * numLevels));
-    accumulateRepetitionHistogram(chunkSizeStatistics_.get(), numLevels, levels);
+    accumulateRepetitionHistogram(
+        chunkSizeStatistics_.get(), numLevels, levels);
     accumulateRepetitionHistogram(pageSizeStatistics_.get(), numLevels, levels);
   }
 

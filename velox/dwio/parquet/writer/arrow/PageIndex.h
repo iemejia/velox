@@ -328,10 +328,13 @@ class PARQUET_EXPORT OffsetIndexBuilder {
   virtual ~OffsetIndexBuilder() = default;
 
   /// \brief Add page location of a data page.
+  /// \param unencodedByteArrayDataBytes Unencoded BYTE_ARRAY data bytes for the
+  /// page, appended to the offset index when present.
   virtual void addPage(
       int64_t offset,
       int32_t compressedPageSize,
-      int64_t firstRowIndex) = 0;
+      int64_t firstRowIndex,
+      std::optional<int64_t> unencodedByteArrayDataBytes = std::nullopt) = 0;
 
   /// \brief Add page location of a data page.
   void addPage(const PageLocation& pageLocation) {

@@ -972,6 +972,14 @@ struct OffsetIndex {
    * that page_locations[i].first_row_index < page_locations[i+1].first_row_index.
    */
   1: list<PageLocation> page_locations;
+
+  /**
+   * Unencoded/uncompressed size of the data in the page for BYTE_ARRAY
+   * physical type. See the documentation for unencoded_byte_array_data_bytes
+   * in SizeStatistics for more details. When present, there is one element per
+   * page.
+   */
+  2: optional list<i64> unencoded_byte_array_data_bytes;
 }
 
 /**

@@ -23,8 +23,8 @@
 #include "velox/dwio/parquet/writer/arrow/Encoding.h"
 #include "velox/dwio/parquet/writer/arrow/Exception.h"
 #include "velox/dwio/parquet/writer/arrow/Metadata.h"
-#include "velox/dwio/parquet/writer/arrow/SizeStatistics.h"
 #include "velox/dwio/parquet/writer/arrow/Schema.h"
+#include "velox/dwio/parquet/writer/arrow/SizeStatistics.h"
 #include "velox/dwio/parquet/writer/arrow/Statistics.h"
 #include "velox/dwio/parquet/writer/arrow/ThriftInternal.h"
 #include "velox/dwio/parquet/writer/arrow/util/OverflowUtilInternal.h"
@@ -682,7 +682,9 @@ class OffsetIndexBuilderImpl final : public OffsetIndexBuilder {
   void addPage(
       int64_t offset,
       int32_t compressedPageSize,
-      int64_t firstRowIndex) override {
+      int64_t firstRowIndex,
+      std::optional<int64_t> unencodedByteArrayDataBytes =
+          std::nullopt) override {
     if (state_ == BuilderState::kFinished) {
       throw ParquetException("Cannot add page to finished OffsetIndexBuilder.");
     } else if (state_ == BuilderState::kDiscarded) {
@@ -697,6 +699,11 @@ class OffsetIndexBuilderImpl final : public OffsetIndexBuilder {
     page_location.compressed_page_size() = compressedPageSize;
     page_location.first_row_index() = firstRowIndex;
     offsetIndex_.page_locations()->emplace_back(std::move(page_location));
+
+    if (unencodedByteArrayDataBytes.has_value()) {
+      offsetIndex_.unencoded_byte_array_data_bytes().ensure().push_back(
+          unencodedByteArrayDataBytes.value());
+    }
   }
 
   void finish(int64_t finalPosition) override {
