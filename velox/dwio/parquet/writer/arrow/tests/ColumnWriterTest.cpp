@@ -27,6 +27,7 @@
 #include "arrow/util/bitmap_builders.h"
 
 #include "velox/dwio/parquet/writer/arrow/ColumnWriter.h"
+#include "velox/dwio/parquet/writer/arrow/SizeStatistics.h"
 #include "velox/dwio/parquet/writer/arrow/FileWriter.h"
 #include "velox/dwio/parquet/writer/arrow/Metadata.h"
 #include "velox/dwio/parquet/writer/arrow/Platform.h"
@@ -104,10 +105,12 @@ class TestPrimitiveWriter : public PrimitiveTypedTest<TestType> {
       int64_t outputSize = SMALL_SIZE,
       const ColumnProperties& columnProps = ColumnProperties(),
       const ParquetVersion::type version = ParquetVersion::PARQUET_1_0,
-      bool enableChecksum = false) {
+      bool enableChecksum = false,
+      SizeStatisticsLevel sizeStatisticsLevel = SizeStatisticsLevel::kNone) {
     sink_ = createOutputStream();
     WriterProperties::Builder wpBuilder;
     wpBuilder.version(version);
+    wpBuilder.sizeStatisticsLevel(sizeStatisticsLevel);
     if (columnProps.encoding() == Encoding::kPlainDictionary ||
         columnProps.encoding() == Encoding::kRleDictionary) {
       wpBuilder.enableDictionary();
@@ -379,6 +382,16 @@ class TestPrimitiveWriter : public PrimitiveTypedTest<TestType> {
         &appVersion);
     auto encodedStats = metadataAccessor->statistics()->encode();
     return {encodedStats.hasMin, encodedStats.hasMax};
+  }
+
+  std::shared_ptr<SizeStatistics> metadataSizeStatistics() {
+    ApplicationVersion appVersion(this->writerProperties_->createdBy());
+    auto metadataAccessor = ColumnChunkMetaData::make(
+        metadata_->Contents(),
+        this->descr_,
+        defaultReaderProperties(),
+        &appVersion);
+    return metadataAccessor->sizeStatistics();
   }
 
   std::vector<Encoding::type> metadataEncodings() {
@@ -654,6 +667,36 @@ TYPED_TEST(TestPrimitiveWriter, Optional) {
   this->valuesOut_.resize(99);
   this->values_.resize(99);
   ASSERT_EQ(this->values_, this->valuesOut_);
+}
+
+// Collects column-chunk level size statistics for an optional column and reads
+// the definition level histogram back from the column metadata.
+TYPED_TEST(TestPrimitiveWriter, OptionalColumnChunkSizeStatistics) {
+  this->setUpSchema(Repetition::kOptional);
+
+  this->generateData(SMALL_SIZE);
+  std::vector<int16_t> definitionLevels(SMALL_SIZE, 1);
+  definitionLevels[1] = 0;
+
+  auto writer = this->buildWriter(
+      SMALL_SIZE,
+      ColumnProperties(),
+      ParquetVersion::PARQUET_1_0,
+      /*enableChecksum=*/false,
+      SizeStatisticsLevel::kColumnChunk);
+  writer->writeBatch(
+      this->values_.size(), definitionLevels.data(), nullptr, this->valuesPtr_);
+  writer->close();
+
+  auto sizeStatistics = this->metadataSizeStatistics();
+  ASSERT_NE(sizeStatistics, nullptr);
+  // Max definition level is 1, so the histogram has two buckets: one null and
+  // the rest non-null.
+  ASSERT_EQ(sizeStatistics->definitionLevelHistogram.size(), 2u);
+  EXPECT_EQ(sizeStatistics->definitionLevelHistogram[0], 1);
+  EXPECT_EQ(sizeStatistics->definitionLevelHistogram[1], SMALL_SIZE - 1);
+  // Max repetition level is 0, so no repetition histogram is written.
+  EXPECT_TRUE(sizeStatistics->repetitionLevelHistogram.empty());
 }
 
 TYPED_TEST(TestPrimitiveWriter, OptionalSpaced) {
