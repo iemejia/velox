@@ -153,8 +153,10 @@ Structural changes:
      full parquet-format surface: column-chunk histograms and unencoded bytes,
      and page-level histograms (column index) and unencoded bytes (offset
      index).
-  9. **[Remaining]** Flipping the default level to match upstream is a behavior
-     change and should ship on its own with broad test validation.
+  9. **[Done]** The default level is `kPageAndColumnChunk`, matching upstream, so
+     size statistics are written by default. The full parquet writer, reader,
+     table-scan, page-reader, common, and Arrow-bridge suites stay green with the
+     default on; callers can opt out with `kNone`.
 
 **P2 — features (larger, optional):**
 
