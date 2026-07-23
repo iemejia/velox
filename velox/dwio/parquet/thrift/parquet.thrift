@@ -240,8 +240,40 @@ struct Statistics {
     * Values are encoded using PLAIN encoding, except that variable-length byte
     * arrays do not include a length prefix.
     */
-  5: optional binary max_value;
-  6: optional binary min_value;
+   5: optional binary max_value;
+   6: optional binary min_value;
+}
+
+/**
+ * A structure for capturing metadata for estimating the unencoded,
+ * uncompressed size of data written. This is useful for readers to estimate
+ * how much memory is needed to reconstruct data in their memory model and for
+ * fine-grained filter pushdown on nested structures (the histograms contained
+ * in this structure can help determine the number of nulls at a particular
+ * nesting level and maximum length of lists).
+ */
+struct SizeStatistics {
+   /**
+    * The number of physical bytes stored for BYTE_ARRAY data values assuming
+    * no encoding. This is exclusive of the bytes needed to store the length of
+    * each byte array. This field should only be set for types that use
+    * BYTE_ARRAY as their physical type.
+    */
+   1: optional i64 unencoded_byte_array_data_bytes;
+   /**
+    * When present, there is expected to be one element corresponding to each
+    * repetition (i.e. size=max repetition_level+1) where each element
+    * represents the number of times the repetition level was observed in the
+    * data. This field may be omitted if max_repetition_level is 0 without loss
+    * of information.
+    */
+   2: optional list<i64> repetition_level_histogram;
+   /**
+    * Same as repetition_level_histogram except for definition levels. This
+    * field may be omitted if max_definition_level is 0 or 1 without loss of
+    * information.
+    */
+   3: optional list<i64> definition_level_histogram;
 }
 
 /** Empty structs to use as logical type annotations */
@@ -767,6 +799,14 @@ struct ColumnMetaData {
 
   /** Byte offset from beginning of file to Bloom filter data. **/
   14: optional i64 bloom_filter_offset;
+
+  /**
+   * Optional statistics to help estimate total memory when converted to
+   * in-memory representations. The histograms contained in these statistics can
+   * also be useful in some cases for more fine-grained nullability/list length
+   * filter pushdown.
+   */
+  16: optional SizeStatistics size_statistics;
 }
 
 struct EncryptionWithFooterKey {}
