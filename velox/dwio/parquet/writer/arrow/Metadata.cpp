@@ -37,6 +37,7 @@
 #include "velox/dwio/parquet/writer/arrow/FileDecryptorInternal.h"
 #include "velox/dwio/parquet/writer/arrow/Schema.h"
 #include "velox/dwio/parquet/writer/arrow/SchemaInternal.h"
+#include "velox/dwio/parquet/writer/arrow/SizeStatistics.h"
 #include "velox/dwio/parquet/writer/arrow/ThriftInternal.h"
 
 namespace facebook::velox::parquet::arrow {
@@ -371,6 +372,28 @@ class ColumnChunkMetaData::ColumnChunkMetaDataImpl {
     return isStatsSet() ? possibleStats_ : nullptr;
   }
 
+  inline std::shared_ptr<SizeStatistics> sizeStatistics() const {
+    if (!columnMetadata_->size_statistics().has_value()) {
+      return nullptr;
+    }
+    const auto& thriftSizeStatistics =
+        columnMetadata_->size_statistics().value();
+    auto sizeStatistics = std::make_shared<SizeStatistics>();
+    if (thriftSizeStatistics.unencoded_byte_array_data_bytes().has_value()) {
+      sizeStatistics->unencodedByteArrayDataBytes =
+          thriftSizeStatistics.unencoded_byte_array_data_bytes().value();
+    }
+    if (thriftSizeStatistics.repetition_level_histogram().has_value()) {
+      sizeStatistics->repetitionLevelHistogram =
+          thriftSizeStatistics.repetition_level_histogram().value();
+    }
+    if (thriftSizeStatistics.definition_level_histogram().has_value()) {
+      sizeStatistics->definitionLevelHistogram =
+          thriftSizeStatistics.definition_level_histogram().value();
+    }
+    return sizeStatistics;
+  }
+
   inline Compression::type compression() const {
     return loadEnumSafe(&*columnMetadata_->codec());
   }
@@ -539,6 +562,10 @@ std::shared_ptr<schema::ColumnPath> ColumnChunkMetaData::pathInSchema() const {
 
 std::shared_ptr<Statistics> ColumnChunkMetaData::statistics() const {
   return impl_->statistics();
+}
+
+std::shared_ptr<SizeStatistics> ColumnChunkMetaData::sizeStatistics() const {
+  return impl_->sizeStatistics();
 }
 
 bool ColumnChunkMetaData::isStatsSet() const {
@@ -1801,6 +1828,24 @@ class ColumnChunkMetaDataBuilder::ColumnChunkMetaDataBuilderImpl {
     }
   }
 
+  void setSizeStatistics(const SizeStatistics& sizeStatistics) {
+    facebook::velox::parquet::thrift::SizeStatistics thriftSizeStatistics;
+    if (sizeStatistics.unencodedByteArrayDataBytes.has_value()) {
+      thriftSizeStatistics.unencoded_byte_array_data_bytes() =
+          sizeStatistics.unencodedByteArrayDataBytes.value();
+    }
+    if (!sizeStatistics.repetitionLevelHistogram.empty()) {
+      thriftSizeStatistics.repetition_level_histogram() =
+          sizeStatistics.repetitionLevelHistogram;
+    }
+    if (!sizeStatistics.definitionLevelHistogram.empty()) {
+      thriftSizeStatistics.definition_level_histogram() =
+          sizeStatistics.definitionLevelHistogram;
+    }
+    apache::thrift::can_throw(columnChunk_->meta_data())->size_statistics() =
+        std::move(thriftSizeStatistics);
+  }
+
   // column chunk
   void set_file_path(const std::string& val) {
     columnChunk_->file_path() = val;
@@ -2071,6 +2116,11 @@ const ColumnDescriptor* ColumnChunkMetaDataBuilder::descr() const {
 void ColumnChunkMetaDataBuilder::setStatistics(
     const EncodedStatistics& result) {
   impl_->setStatistics(result);
+}
+
+void ColumnChunkMetaDataBuilder::setSizeStatistics(
+    const SizeStatistics& sizeStatistics) {
+  impl_->setSizeStatistics(sizeStatistics);
 }
 
 int64_t ColumnChunkMetaDataBuilder::totalCompressedSize() const {
