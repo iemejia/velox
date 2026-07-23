@@ -27,11 +27,11 @@
 #include "arrow/util/bitmap_builders.h"
 
 #include "velox/dwio/parquet/writer/arrow/ColumnWriter.h"
-#include "velox/dwio/parquet/writer/arrow/SizeStatistics.h"
 #include "velox/dwio/parquet/writer/arrow/FileWriter.h"
 #include "velox/dwio/parquet/writer/arrow/Metadata.h"
 #include "velox/dwio/parquet/writer/arrow/Platform.h"
 #include "velox/dwio/parquet/writer/arrow/Properties.h"
+#include "velox/dwio/parquet/writer/arrow/SizeStatistics.h"
 #include "velox/dwio/parquet/writer/arrow/Statistics.h"
 #include "velox/dwio/parquet/writer/arrow/ThriftInternal.h"
 #include "velox/dwio/parquet/writer/arrow/Types.h"
@@ -556,6 +556,35 @@ TEST_F(TestValuesWriterInt64Type, RequiredDeltaBinaryPacked) {
 
 TEST_F(TestByteArrayValuesWriter, RequiredDeltaLengthByteArray) {
   this->testRequiredWithEncoding(Encoding::kDeltaLengthByteArray);
+}
+
+// Collects the unencoded BYTE_ARRAY data byte count for a required column and
+// reads it back from the column metadata.
+TEST_F(TestByteArrayValuesWriter, RequiredColumnChunkUnencodedBytes) {
+  this->setUpSchema(Repetition::kRequired);
+  this->generateData(SMALL_SIZE);
+
+  int64_t expectedBytes = 0;
+  for (const auto& value : this->values_) {
+    expectedBytes += value.len;
+  }
+
+  auto writer = this->buildWriter(
+      SMALL_SIZE,
+      ColumnProperties(),
+      ParquetVersion::PARQUET_1_0,
+      /*enableChecksum=*/false,
+      SizeStatisticsLevel::kColumnChunk);
+  writer->writeBatch(this->values_.size(), nullptr, nullptr, this->valuesPtr_);
+  writer->close();
+
+  auto sizeStatistics = this->metadataSizeStatistics();
+  ASSERT_NE(sizeStatistics, nullptr);
+  ASSERT_TRUE(sizeStatistics->unencodedByteArrayDataBytes.has_value());
+  EXPECT_EQ(sizeStatistics->unencodedByteArrayDataBytes.value(), expectedBytes);
+  // A required, non-nested column has no level histograms.
+  EXPECT_TRUE(sizeStatistics->definitionLevelHistogram.empty());
+  EXPECT_TRUE(sizeStatistics->repetitionLevelHistogram.empty());
 }
 
 /*

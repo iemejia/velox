@@ -934,10 +934,6 @@ class ColumnWriterImpl {
     if (properties_->sizeStatisticsLevel() ==
         SizeStatisticsLevel::kColumnChunk) {
       chunkSizeStatistics_ = SizeStatistics::make(descr_);
-      // TODO: collect unencoded BYTE_ARRAY data bytes. Until then only the
-      // level histograms are populated, so drop the byte-count field rather
-      // than write an incorrect zero.
-      chunkSizeStatistics_->unencodedByteArrayDataBytes.reset();
     }
   }
 
@@ -1990,6 +1986,39 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
     if (pageStatistics_ != nullptr) {
       pageStatistics_->update(values, numValues, numNulls);
     }
+    updateUnencodedByteArrayDataBytes(
+        values, numValues, numValues, /*validBits=*/nullptr, 0);
+  }
+
+  // Accumulates the unencoded BYTE_ARRAY data bytes (excluding the length
+  // prefix) into the column-chunk size statistics. A no-op for other types.
+  void updateUnencodedByteArrayDataBytes(
+      const T* values,
+      int64_t numValues,
+      int64_t numSpacedValues,
+      const uint8_t* validBits,
+      int64_t validBitsOffset) {
+    if constexpr (std::is_same_v<T, ByteArray>) {
+      if (chunkSizeStatistics_ == nullptr ||
+          !chunkSizeStatistics_->unencodedByteArrayDataBytes.has_value()) {
+        return;
+      }
+      int64_t bytes = 0;
+      if (validBits == nullptr || numValues == numSpacedValues) {
+        // Values are packed with no nulls.
+        for (int64_t i = 0; i < numValues; ++i) {
+          bytes += values[i].len;
+        }
+      } else {
+        // Values are spaced; only sum the non-null (valid) positions.
+        for (int64_t i = 0; i < numSpacedValues; ++i) {
+          if (::arrow::bit_util::GetBit(validBits, validBitsOffset + i)) {
+            bytes += values[i].len;
+          }
+        }
+      }
+      chunkSizeStatistics_->incrementUnencodedByteArrayDataBytes(bytes);
+    }
   }
 
   /// \brief Write values with spaces and update page statistics accordingly.
@@ -2031,6 +2060,8 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
           numValues,
           numNulls);
     }
+    updateUnencodedByteArrayDataBytes(
+        values, numValues, numSpacedValues, validBits, validBitsOffset);
   }
 };
 
