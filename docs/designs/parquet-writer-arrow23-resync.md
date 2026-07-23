@@ -130,18 +130,18 @@ Structural changes:
   2. **[Done]** Vendored `SizeStatistics.{h,cpp}` (rehomed) with level-histogram
      and unencoded-byte accounting, plus a `SizeStatisticsLevel` writer property
      defaulting to `kNone` (no behavior change).
-  3. **[Remaining]** `ColumnWriter.cpp`: hold a per-chunk `SizeStatistics`
-     (`SizeStatistics::make(descr_)` when the level is `kColumnChunk`), call
-     `updateLevelHistogram` over the def/rep levels as batches are written, and
-     for BYTE_ARRAY columns increment `unencodedByteArrayDataBytes`. Set it on
-     the column metadata in `close()`.
-  4. **[Remaining]** `Metadata.cpp`: add
-     `ColumnChunkMetaDataBuilder::setSizeStatistics` mirroring `setStatistics`
-     (assign the FBThrift `size_statistics` field), and a
-     `ColumnChunkMetaData::sizeStatistics()` reader.
-  5. **[Remaining]** Test: write with `kColumnChunk`, read the metadata back,
-     and assert the histograms and unencoded byte count. Consider page-level
-     (`ColumnIndex`) support and flipping the default in a later change.
+  3. **[Done]** `ColumnWriter.cpp`: holds a per-chunk `SizeStatistics`
+     (`SizeStatistics::make(descr_)` when the level is `kColumnChunk`) and calls
+     `updateLevelHistogram` over the def/rep levels off the level-writing path,
+     setting it on the column metadata in `close()`.
+  4. **[Done]** `Metadata.cpp`: `ColumnChunkMetaDataBuilder::setSizeStatistics`
+     writes the FBThrift `size_statistics` field, and
+     `ColumnChunkMetaData::sizeStatistics()` reads it back.
+  5. **[Done]** Test: writes an optional column with `kColumnChunk` and asserts
+     the definition level histogram round-trips for every primitive type.
+  6. **[Remaining]** Unencoded BYTE_ARRAY byte accounting (currently suppressed
+     rather than written as an incorrect zero), page-level (`ColumnIndex`)
+     support, and flipping the default.
 
 **P2 — features (larger, optional):**
 
