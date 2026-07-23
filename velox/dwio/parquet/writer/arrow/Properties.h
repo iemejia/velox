@@ -229,7 +229,7 @@ static constexpr Compression::type DEFAULT_COMPRESSION_TYPE =
     Compression::UNCOMPRESSED;
 static constexpr bool DEFAULT_IS_PAGE_INDEX_ENABLED = false;
 static constexpr SizeStatisticsLevel DEFAULT_SIZE_STATISTICS_LEVEL =
-    SizeStatisticsLevel::kNone;
+    SizeStatisticsLevel::kPageAndColumnChunk;
 
 class PARQUET_EXPORT ColumnProperties {
  public:
@@ -423,7 +423,7 @@ class PARQUET_EXPORT WriterProperties {
     }
 
     /// Sets the granularity at which size statistics are collected. Defaults to
-    /// SizeStatisticsLevel::kNone.
+    /// SizeStatisticsLevel::kPageAndColumnChunk.
     Builder* sizeStatisticsLevel(SizeStatisticsLevel level) {
       sizeStatisticsLevel_ = level;
       return this;
