@@ -487,7 +487,7 @@ class SerializedPageWriter : public PageWriter {
 
     /// Collect page index.
     if (columnIndexBuilder_ != nullptr) {
-      columnIndexBuilder_->addPage(page.statistics());
+      columnIndexBuilder_->addPage(page.statistics(), page.sizeStatistics());
     }
     if (offsetIndexBuilder_ != nullptr) {
       const int64_t compressedSize = outputDataLen + headerSize;
@@ -934,6 +934,10 @@ class ColumnWriterImpl {
     if (properties_->sizeStatisticsLevel() != SizeStatisticsLevel::kNone) {
       chunkSizeStatistics_ = SizeStatistics::make(descr_);
     }
+    if (properties_->sizeStatisticsLevel() ==
+        SizeStatisticsLevel::kPageAndColumnChunk) {
+      pageSizeStatistics_ = SizeStatistics::make(descr_);
+    }
   }
 
   virtual ~ColumnWriterImpl() = default;
@@ -977,19 +981,38 @@ class ColumnWriterImpl {
   }
 
   // Write multiple definition levels.
+  static void accumulateDefinitionHistogram(
+      SizeStatistics* stats,
+      int64_t numLevels,
+      const int16_t* levels) {
+    if (stats != nullptr && !stats->definitionLevelHistogram.empty()) {
+      updateLevelHistogram(
+          levels,
+          numLevels,
+          stats->definitionLevelHistogram.data(),
+          static_cast<int64_t>(stats->definitionLevelHistogram.size()));
+    }
+  }
+
+  static void accumulateRepetitionHistogram(
+      SizeStatistics* stats,
+      int64_t numLevels,
+      const int16_t* levels) {
+    if (stats != nullptr && !stats->repetitionLevelHistogram.empty()) {
+      updateLevelHistogram(
+          levels,
+          numLevels,
+          stats->repetitionLevelHistogram.data(),
+          static_cast<int64_t>(stats->repetitionLevelHistogram.size()));
+    }
+  }
+
   void writeDefinitionLevels(int64_t numLevels, const int16_t* levels) {
     VELOX_DCHECK(!closed_);
     PARQUET_THROW_NOT_OK(
         definitionLevelsSink_.Append(levels, sizeof(int16_t) * numLevels));
-    if (chunkSizeStatistics_ &&
-        !chunkSizeStatistics_->definitionLevelHistogram.empty()) {
-      updateLevelHistogram(
-          levels,
-          numLevels,
-          chunkSizeStatistics_->definitionLevelHistogram.data(),
-          static_cast<int64_t>(
-              chunkSizeStatistics_->definitionLevelHistogram.size()));
-    }
+    accumulateDefinitionHistogram(chunkSizeStatistics_.get(), numLevels, levels);
+    accumulateDefinitionHistogram(pageSizeStatistics_.get(), numLevels, levels);
   }
 
   // Write multiple repetition levels.
@@ -997,15 +1020,19 @@ class ColumnWriterImpl {
     VELOX_DCHECK(!closed_);
     PARQUET_THROW_NOT_OK(
         repetitionLevelsSink_.Append(levels, sizeof(int16_t) * numLevels));
-    if (chunkSizeStatistics_ &&
-        !chunkSizeStatistics_->repetitionLevelHistogram.empty()) {
-      updateLevelHistogram(
-          levels,
-          numLevels,
-          chunkSizeStatistics_->repetitionLevelHistogram.data(),
-          static_cast<int64_t>(
-              chunkSizeStatistics_->repetitionLevelHistogram.size()));
+    accumulateRepetitionHistogram(chunkSizeStatistics_.get(), numLevels, levels);
+    accumulateRepetitionHistogram(pageSizeStatistics_.get(), numLevels, levels);
+  }
+
+  // Snapshots the current page's size statistics and resets the accumulator for
+  // the next page. Returns an empty value when page statistics are disabled.
+  SizeStatistics takePageSizeStatistics() {
+    if (pageSizeStatistics_ == nullptr) {
+      return SizeStatistics();
     }
+    SizeStatistics snapshot = *pageSizeStatistics_;
+    pageSizeStatistics_->reset();
+    return snapshot;
   }
 
   // RLE encode the src_buffer into dest_buffer and return the encoded size.
@@ -1071,6 +1098,10 @@ class ColumnWriterImpl {
   // Accumulated size statistics for the whole column chunk, or null when size
   // statistics collection is disabled.
   std::unique_ptr<SizeStatistics> chunkSizeStatistics_;
+
+  // Accumulated size statistics for the current data page, or null unless
+  // page-level statistics are enabled. Reset after each page is built.
+  std::unique_ptr<SizeStatistics> pageSizeStatistics_;
 
   ::arrow::BufferBuilder definitionLevelsSink_;
   ::arrow::BufferBuilder repetitionLevelsSink_;
@@ -1237,7 +1268,8 @@ void ColumnWriterImpl::buildDataPageV1(
         Encoding::kRle,
         uncompressedSize,
         pageStats,
-        firstRowIndex);
+        firstRowIndex,
+        takePageSizeStatistics());
     totalCompressedBytes_ +=
         pagePtr->size() + sizeof(facebook::velox::parquet::thrift::PageHeader);
 
@@ -1251,7 +1283,8 @@ void ColumnWriterImpl::buildDataPageV1(
         Encoding::kRle,
         uncompressedSize,
         pageStats,
-        firstRowIndex);
+        firstRowIndex,
+        takePageSizeStatistics());
     writeDataPage(page);
   }
 }
@@ -1316,7 +1349,8 @@ void ColumnWriterImpl::buildDataPageV2(
         uncompressedSize,
         pager_->hasCompressor(),
         pageStats,
-        firstRowIndex);
+        firstRowIndex,
+        takePageSizeStatistics());
     totalCompressedBytes_ +=
         pagePtr->size() + sizeof(facebook::velox::parquet::thrift::PageHeader);
     dataPages_.push_back(std::move(pagePtr));
@@ -1332,7 +1366,8 @@ void ColumnWriterImpl::buildDataPageV2(
         uncompressedSize,
         pager_->hasCompressor(),
         pageStats,
-        firstRowIndex);
+        firstRowIndex,
+        takePageSizeStatistics());
     writeDataPage(page);
   }
 }
@@ -1998,8 +2033,11 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
       const uint8_t* validBits,
       int64_t validBitsOffset) {
     if constexpr (std::is_same_v<T, ByteArray>) {
-      if (chunkSizeStatistics_ == nullptr ||
-          !chunkSizeStatistics_->unencodedByteArrayDataBytes.has_value()) {
+      const bool chunkWants = chunkSizeStatistics_ != nullptr &&
+          chunkSizeStatistics_->unencodedByteArrayDataBytes.has_value();
+      const bool pageWants = pageSizeStatistics_ != nullptr &&
+          pageSizeStatistics_->unencodedByteArrayDataBytes.has_value();
+      if (!chunkWants && !pageWants) {
         return;
       }
       int64_t bytes = 0;
@@ -2016,7 +2054,12 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
           }
         }
       }
-      chunkSizeStatistics_->incrementUnencodedByteArrayDataBytes(bytes);
+      if (chunkWants) {
+        chunkSizeStatistics_->incrementUnencodedByteArrayDataBytes(bytes);
+      }
+      if (pageWants) {
+        pageSizeStatistics_->incrementUnencodedByteArrayDataBytes(bytes);
+      }
     }
   }
 

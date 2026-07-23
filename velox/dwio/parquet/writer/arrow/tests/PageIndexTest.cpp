@@ -17,6 +17,8 @@
 // Adapted from Apache Arrow.
 
 #include "velox/dwio/parquet/writer/arrow/PageIndex.h"
+#include "velox/dwio/parquet/writer/arrow/SizeStatistics.h"
+#include "velox/dwio/parquet/thrift/ParquetThrift.h"
 
 #include <gtest/gtest.h>
 
@@ -295,7 +297,7 @@ void testWriteTypedColumnIndex(
 
   auto Builder = ColumnIndexBuilder::make(descr.get());
   for (const auto& stats : pageStats) {
-    Builder->addPage(stats);
+    Builder->addPage(stats, SizeStatistics());
   }
   ASSERT_NO_THROW(Builder->finish());
 
@@ -459,7 +461,7 @@ TEST(PageIndex, WriteColumnIndexWithCorruptedStats) {
   ColumnDescriptor descr(schema::int32("c1"), 1, 0);
   auto Builder = ColumnIndexBuilder::make(&descr);
   for (const auto& stats : pageStats) {
-    Builder->addPage(stats);
+    Builder->addPage(stats, SizeStatistics());
   }
   ASSERT_NO_THROW(Builder->finish());
   ASSERT_EQ(nullptr, Builder->build());
@@ -468,6 +470,53 @@ TEST(PageIndex, WriteColumnIndexWithCorruptedStats) {
   Builder->writeTo(sink.get());
   PARQUET_ASSIGN_OR_THROW(auto buffer, sink->Finish());
   EXPECT_EQ(0, buffer->size());
+}
+
+// Concatenates each page's level histograms into the column index and verifies
+// the serialized order.
+TEST(PageIndex, WriteColumnIndexWithSizeStatistics) {
+  auto encode = [](int32_t value) {
+    return std::string(reinterpret_cast<const char*>(&value), sizeof(int32_t));
+  };
+
+  // Optional column: maximum definition level 1.
+  ColumnDescriptor descr(schema::int32("c1"), 1, 0);
+  auto builder = ColumnIndexBuilder::make(&descr);
+
+  std::vector<EncodedStatistics> pageStats(2);
+  pageStats.at(0).setMin(encode(1)).setMax(encode(2)).setNullCount(2);
+  pageStats.at(1).setMin(encode(3)).setMax(encode(4)).setNullCount(1);
+
+  SizeStatistics sizeStats0;
+  sizeStats0.definitionLevelHistogram = {2, 8};
+  SizeStatistics sizeStats1;
+  sizeStats1.definitionLevelHistogram = {1, 9};
+
+  builder->addPage(pageStats[0], sizeStats0);
+  builder->addPage(pageStats[1], sizeStats1);
+  ASSERT_NO_THROW(builder->finish());
+
+  auto sink = createOutputStream();
+  builder->writeTo(sink.get());
+  PARQUET_ASSIGN_OR_THROW(auto buffer, sink->Finish());
+
+  ::facebook::velox::parquet::thrift::ColumnIndex thriftColumnIndex;
+  ::facebook::velox::parquet::thrift::deserialize(
+      &thriftColumnIndex,
+      std::string_view(
+          reinterpret_cast<const char*>(buffer->data()), buffer->size()));
+
+  ASSERT_TRUE(thriftColumnIndex.definition_level_histograms().has_value());
+  // Per-page histograms are concatenated in page order.
+  const auto& histogram =
+      thriftColumnIndex.definition_level_histograms().value();
+  ASSERT_EQ(histogram.size(), 4u);
+  EXPECT_EQ(histogram[0], 2);
+  EXPECT_EQ(histogram[1], 8);
+  EXPECT_EQ(histogram[2], 1);
+  EXPECT_EQ(histogram[3], 9);
+  // No repetition levels were provided.
+  EXPECT_FALSE(thriftColumnIndex.repetition_level_histograms().has_value());
 }
 
 TEST(PageIndex, TestPageIndexBuilderWithZeroRowGroup) {
@@ -512,7 +561,8 @@ class PageIndexBuilderTest : public ::testing::Test {
         if (static_cast<size_t>(column) < pageStats[rowGroup].size()) {
           auto ColumnIndexBuilder = Builder->getColumnIndexBuilder(column);
           ASSERT_NO_THROW(
-              ColumnIndexBuilder->addPage(pageStats[rowGroup][column]));
+              ColumnIndexBuilder->addPage(
+                  pageStats[rowGroup][column], SizeStatistics()));
           ASSERT_NO_THROW(ColumnIndexBuilder->finish());
         }
 

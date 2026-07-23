@@ -28,6 +28,7 @@ namespace facebook::velox::parquet::arrow {
 
 class ColumnDescriptor;
 class EncodedStatistics;
+struct SizeStatistics;
 class FileMetaData;
 class InternalFileDecryptor;
 struct PageIndexLocation;
@@ -290,7 +291,11 @@ class PARQUET_EXPORT ColumnIndexBuilder {
   /// not update statistics any more.
   ///
   /// \param stats Page statistics in the encoded form.
-  virtual void addPage(const EncodedStatistics& stats) = 0;
+  /// \param sizeStatistics Page size statistics whose level histograms are
+  /// concatenated into the column index.
+  virtual void addPage(
+      const EncodedStatistics& stats,
+      const SizeStatistics& sizeStatistics) = 0;
 
   /// \brief Complete the column index.
   ///

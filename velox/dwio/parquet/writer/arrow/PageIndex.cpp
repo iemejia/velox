@@ -23,6 +23,7 @@
 #include "velox/dwio/parquet/writer/arrow/Encoding.h"
 #include "velox/dwio/parquet/writer/arrow/Exception.h"
 #include "velox/dwio/parquet/writer/arrow/Metadata.h"
+#include "velox/dwio/parquet/writer/arrow/SizeStatistics.h"
 #include "velox/dwio/parquet/writer/arrow/Schema.h"
 #include "velox/dwio/parquet/writer/arrow/Statistics.h"
 #include "velox/dwio/parquet/writer/arrow/ThriftInternal.h"
@@ -513,7 +514,9 @@ class ColumnIndexBuilderImpl final : public ColumnIndexBuilder {
         facebook::velox::parquet::thrift::BoundaryOrder::UNORDERED;
   }
 
-  void addPage(const EncodedStatistics& stats) override {
+  void addPage(
+      const EncodedStatistics& stats,
+      const SizeStatistics& sizeStatistics) override {
     if (state_ == BuilderState::kFinished) {
       throw ParquetException("Cannot add page to finished ColumnIndexBuilder.");
     } else if (state_ == BuilderState::kDiscarded) {
@@ -544,6 +547,22 @@ class ColumnIndexBuilderImpl final : public ColumnIndexBuilder {
       columnIndex_.null_counts()->emplace_back(stats.nullCount);
     } else {
       columnIndex_.null_counts().reset();
+    }
+
+    /// Concatenate this page's level histograms into the column index.
+    if (!sizeStatistics.definitionLevelHistogram.empty()) {
+      auto& histogram = columnIndex_.definition_level_histograms().ensure();
+      histogram.insert(
+          histogram.end(),
+          sizeStatistics.definitionLevelHistogram.cbegin(),
+          sizeStatistics.definitionLevelHistogram.cend());
+    }
+    if (!sizeStatistics.repetitionLevelHistogram.empty()) {
+      auto& histogram = columnIndex_.repetition_level_histograms().ensure();
+      histogram.insert(
+          histogram.end(),
+          sizeStatistics.repetitionLevelHistogram.cbegin(),
+          sizeStatistics.repetitionLevelHistogram.cend());
     }
   }
 
