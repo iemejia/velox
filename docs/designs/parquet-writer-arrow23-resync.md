@@ -142,15 +142,15 @@ Structural changes:
   6. **[Done]** Unencoded BYTE_ARRAY byte accounting: the writer sums the
      unencoded value lengths (packed and spaced paths) into
      `unencodedByteArrayDataBytes`, verified by a round-trip test.
-  7. **[Remaining]** Page-level size statistics. This is a separate, larger
-     change and is lower value for Velox specifically, since the production
-     reader does not consume the page index. It needs: `ColumnIndex` Thrift
-     fields (`repetition_level_histograms`, `definition_level_histograms`,
-     `unencoded_byte_array_data_bytes`); a `kPageAndColumnChunk` level; per-page
-     `SizeStatistics` in `ColumnWriter` merged into the chunk on page flush and
-     handed to the column index builder; and `PageIndex.cpp` accumulation of the
-     concatenated per-page histograms. Flipping the default level to match
-     upstream is a behavior change and should ship with that work.
+  7. **[Done]** Page-level level histograms. `DataPage` carries a
+     `SizeStatistics`; the column writer accumulates a per-page snapshot and
+     resets it at each page build; the page writer feeds it to
+     `ColumnIndexBuilder::addPage`, which concatenates the definition and
+     repetition level histograms into the `ColumnIndex`. Verified by a builder
+     test that checks the serialized concatenation order.
+  8. **[Remaining]** Unencoded per-page bytes belong in `OffsetIndex` (field 2),
+     a further small step. Flipping the default level to match upstream is a
+     behavior change and should ship on its own with broad test validation.
 
 **P2 — features (larger, optional):**
 
