@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include "velox/dwio/parquet/writer/arrow/GeospatialStatistics.h"
 #include "velox/dwio/parquet/writer/arrow/Platform.h"
 #include "velox/dwio/parquet/writer/arrow/Properties.h"
 #include "velox/dwio/parquet/writer/arrow/Schema.h"
@@ -37,6 +38,7 @@ namespace facebook::velox::parquet::arrow {
 class ColumnDescriptor;
 class EncodedStatistics;
 class Statistics;
+struct SizeStatistics;
 class SchemaDescriptor;
 
 class FileCryptoMetaData;
@@ -174,6 +176,9 @@ class PARQUET_EXPORT ColumnChunkMetaData {
   std::shared_ptr<schema::ColumnPath> pathInSchema() const;
   bool isStatsSet() const;
   std::shared_ptr<Statistics> statistics() const;
+
+  /// Size statistics for this column chunk, or nullptr if not written.
+  std::shared_ptr<SizeStatistics> sizeStatistics() const;
 
   Compression::type compression() const;
   // Indicate if the ColumnChunk compression is supported by the current
@@ -489,6 +494,13 @@ class PARQUET_EXPORT ColumnChunkMetaDataBuilder {
   void setFilePath(const std::string& path);
   // Column metadata.
   void setStatistics(const EncodedStatistics& stats);
+
+  /// Sets the size statistics for this column chunk.
+  void setSizeStatistics(const SizeStatistics& sizeStatistics);
+
+  /// Sets the geospatial (bounding box) statistics for this column chunk.
+  void setGeospatialStatistics(
+      const geospatial::EncodedGeoStatistics& geoStatistics);
   // Get the column descriptor.
   const ColumnDescriptor* descr() const;
 

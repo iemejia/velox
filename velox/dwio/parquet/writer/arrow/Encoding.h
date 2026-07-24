@@ -23,7 +23,7 @@
 #include <memory>
 #include <vector>
 
-#include "arrow/util/spaced.h"
+#include "velox/dwio/parquet/writer/arrow/util/Spaced.h"
 
 #include "velox/dwio/parquet/writer/arrow/Exception.h"
 #include "velox/dwio/parquet/writer/arrow/Platform.h"
@@ -307,7 +307,7 @@ class TypedDecoder : virtual public Decoder {
             "Number of values / definition_levels read did not match");
       }
 
-      return ::arrow::util::internal::SpacedExpand<T>(
+      return ::facebook::velox::parquet::arrow::util::internal::spacedExpand<T>(
           buffer, numValues, nullCount, validBits, validBitsOffset);
     } else {
       return decode(buffer, numValues);

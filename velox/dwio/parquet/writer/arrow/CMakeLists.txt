@@ -22,6 +22,7 @@ velox_add_library(
   velox_dwio_arrow_parquet_writer_lib
   ArrowSchema.cpp
   ArrowSchemaInternal.cpp
+  ChunkerInternal.cpp
   ColumnWriter.cpp
   Encoding.cpp
   Encryption.cpp
@@ -30,6 +31,9 @@ velox_add_library(
   FileEncryptorInternal.cpp
   FileDecryptorInternal.cpp
   FileWriter.cpp
+  GeospatialStatistics.cpp
+  GeospatialUtilInternal.cpp
+  GeospatialUtilJsonInternal.cpp
   Metadata.cpp
   PageIndex.cpp
   PathInternal.cpp
@@ -38,11 +42,14 @@ velox_add_library(
   Schema.cpp
   Statistics.cpp
   StringTruncation.cpp
+  SizeStatistics.cpp
   Types.cpp
   Writer.cpp
   HEADERS
   ArrowSchema.h
   ArrowSchemaInternal.h
+  ChunkerInternal.h
+  ChunkerInternalGenerated.h
   ColumnPage.h
   ColumnWriter.h
   Encoding.h
@@ -52,6 +59,9 @@ velox_add_library(
   FileDecryptorInternal.h
   FileEncryptorInternal.h
   FileWriter.h
+  GeospatialStatistics.h
+  GeospatialUtilInternal.h
+  GeospatialUtilJsonInternal.h
   Metadata.h
   PageIndex.h
   PathInternal.h
@@ -61,6 +71,7 @@ velox_add_library(
   SchemaInternal.h
   Statistics.h
   StringTruncation.h
+  SizeStatistics.h
   ThriftInternal.h
   Types.h
   Writer.h
@@ -74,4 +85,14 @@ velox_link_libraries(
   velox_arrow_bridge
   arrow
   fmt::fmt
+)
+
+# The vendored Arrow-derived writer sources are not C++20 modules. Scanning them
+# for module deps mis-imports Types.h inside the writer namespace; disable it.
+set_source_files_properties(
+  GeospatialStatistics.cpp
+  GeospatialUtilInternal.cpp
+  GeospatialUtilJsonInternal.cpp
+  ChunkerInternal.cpp
+  PROPERTIES CXX_SCAN_FOR_MODULES OFF
 )

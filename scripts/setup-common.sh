@@ -238,13 +238,11 @@ function install_simdjson {
 function install_arrow {
   wget_and_untar https://github.com/apache/arrow/archive/apache-arrow-"${ARROW_VERSION}".tar.gz arrow
   (
-    # Can be removed after an upgrade to Arrow 20.0.0
     if [ -z "$VELOX_ARROW_CMAKE_PATCH" ]; then
       # We need to set a different path when building the Dockerfile.
       ABSOLUTE_SCRIPTDIR=$(realpath "$SCRIPT_DIR")
 
-      VELOX_ARROW_CMAKE_PATCH="$ABSOLUTE_SCRIPTDIR/../CMake/resolve_dependency_modules/arrow/arrow-testing-boost.patch"
-      VELOX_ARROW_CMAKE_PATCH+=" $ABSOLUTE_SCRIPTDIR/../CMake/resolve_dependency_modules/arrow/cmake-compatibility.patch"
+      VELOX_ARROW_CMAKE_PATCH="$ABSOLUTE_SCRIPTDIR/../CMake/resolve_dependency_modules/arrow/cmake-compatibility.patch"
     fi
 
     cd "$DEPENDENCY_DIR"/arrow || exit 1

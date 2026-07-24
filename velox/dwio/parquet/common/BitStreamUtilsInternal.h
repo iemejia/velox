@@ -27,7 +27,10 @@
 #include "velox/common/base/Exceptions.h"
 
 #include "arrow/util/bit_util.h"
-#include "arrow/util/bpacking.h"
+#include "arrow/util/endian.h"
+#include "arrow/util/ubsan.h"
+
+#include "velox/dwio/common/BitPackDecoder.h"
 
 namespace facebook::velox::parquet {
 
@@ -221,7 +224,9 @@ inline bool BitWriter::PutValue(uint64_t v, int numBits) {
     VELOX_DCHECK_EQ(v >> numBits, 0, "v = {}, numBits = {}", v, numBits);
   }
 
-  if (FOLLY_UNLIKELY(byteOffset_ * 8 + bitOffset_ + numBits > maxBytes_ * 8))
+  if (FOLLY_UNLIKELY(
+          static_cast<int64_t>(byteOffset_) * 8 + bitOffset_ + numBits >
+          static_cast<int64_t>(maxBytes_) * 8))
     return false;
 
   bufferedValues_ |= v << bitOffset_;
@@ -350,45 +355,43 @@ inline int BitReader::GetBatch(int numBits, T* v, int batchSize) {
     }
   }
 
+  // The batched bit-unpacker (velox::dwio::common::unpack) requires the number
+  // of values to be a multiple of 8; the remainder is handled by the per-value
+  // GetValue_ loop below. Byte offsets are advanced by the exact number of
+  // bytes the unpacker consumed, tracked via the by-reference input pointer.
+  //
+  // The batched unpacker only supports bit widths up to 32. For numBits > 32
+  // (only possible when sizeof(T) == 8) there is no fast path and all values
+  // are decoded by the per-value GetValue_ loop below.
   if (sizeof(T) == 4) {
-    int numUnpacked = ::arrow::internal::unpack32(
-        reinterpret_cast<const uint32_t*>(buffer + byteOffset),
-        reinterpret_cast<uint32_t*>(v + i),
-        batchSize - i,
-        numBits);
-    i += numUnpacked;
-    byteOffset += numUnpacked * numBits / 8;
-  } else if (sizeof(T) == 8 && numBits > 32) {
-    // Use unpack64 only if numBits is larger than 32
-    // TODO (ARROW-13677): improve the performance of internal::unpack64
-    // and remove the restriction of numBits
-    int numUnpacked = ::arrow::internal::unpack64(
-        buffer + byteOffset,
-        reinterpret_cast<uint64_t*>(v + i),
-        batchSize - i,
-        numBits);
-    i += numUnpacked;
-    byteOffset += numUnpacked * numBits / 8;
-  } else {
-    // TODO: revisit this limit if necessary
-    VELOX_DCHECK_LE(numBits, 32);
+    int toUnpack = (batchSize - i) / 8 * 8;
+    const uint8_t* in = buffer + byteOffset;
+    const uint8_t* inStart = in;
+    uint32_t* out = reinterpret_cast<uint32_t*>(v + i);
+    ::facebook::velox::dwio::common::unpack<uint32_t>(
+        in, maxBytes - byteOffset, toUnpack, numBits, out);
+    i += toUnpack;
+    byteOffset += static_cast<int>(in - inStart);
+  } else if (numBits <= 32) {
+    // sizeof(T) != 4 with numBits <= 32: unpack through a 32-bit staging
+    // buffer.
     const int bufferSize = 1024;
     uint32_t unpackBuffer[bufferSize];
     while (i < batchSize) {
-      int unpack_size = std::min(bufferSize, batchSize - i);
-      int numUnpacked = ::arrow::internal::unpack32(
-          reinterpret_cast<const uint32_t*>(buffer + byteOffset),
-          unpackBuffer,
-          unpack_size,
-          numBits);
-      if (numUnpacked == 0) {
+      int toUnpack = std::min(bufferSize, batchSize - i) / 8 * 8;
+      if (toUnpack == 0) {
         break;
       }
-      for (int k = 0; k < numUnpacked; ++k) {
+      const uint8_t* in = buffer + byteOffset;
+      const uint8_t* inStart = in;
+      uint32_t* out = unpackBuffer;
+      ::facebook::velox::dwio::common::unpack<uint32_t>(
+          in, maxBytes - byteOffset, toUnpack, numBits, out);
+      for (int k = 0; k < toUnpack; ++k) {
         v[i + k] = static_cast<T>(unpackBuffer[k]);
       }
-      i += numUnpacked;
-      byteOffset += numUnpacked * numBits / 8;
+      i += toUnpack;
+      byteOffset += static_cast<int>(in - inStart);
     }
   }
 

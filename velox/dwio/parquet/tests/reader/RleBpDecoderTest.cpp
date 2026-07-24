@@ -19,6 +19,9 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
+#include <limits>
+
 using namespace facebook::velox;
 using namespace facebook::velox::dwio::common;
 
@@ -139,4 +142,15 @@ TEST(RleBpDecoderTest, DISABLED_allOnes) {
   std::vector<uint8_t> allOnesVector(1024, 1);
   RleBpDecoderTest<uint8_t> test;
   test.testDecodeSuppliedData(allOnesVector, 1);
+}
+
+// Regression for apache/arrow GH-47973: buffer-size math for large
+// dictionary-encoded pages must not overflow int32. With the pre-fix int32
+// arithmetic these products wrapped around; they are now computed in int64.
+TEST(RleBpDecoderTest, maxBufferSizeNoInt32Overflow) {
+  constexpr int kBitWidth = 32;
+  constexpr int64_t kNumValues = 2'000'000'000;
+  const int64_t maxBufferSize =
+      RleEncoder::MaxBufferSize(kBitWidth, kNumValues);
+  EXPECT_GT(maxBufferSize, std::numeric_limits<int32_t>::max());
 }

@@ -48,9 +48,6 @@ if(VELOX_ENABLE_ARROW)
     -DCMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}
     -DBOOST_ROOT=${BOOST_ROOT}
     -DBoost_NO_BOOST_CMAKE=TRUE
-    -DCMAKE_POLICY_VERSION_MINIMUM=3.5
-    # Remove with Arrow upgrade to Arrow 20.
-    -DARROW_CXXFLAGS=-Wno-documentation
     # Arrow inherits the CMake build type from Velox. So a Debug build turns
     # on additional warnings that can cause the build to fail
     # (e.g. deprecated-literal-operator in Apple Clang 21).
@@ -59,10 +56,10 @@ if(VELOX_ENABLE_ARROW)
   )
   set(ARROW_LIBDIR ${ARROW_PREFIX}/install/lib)
 
-  set(VELOX_ARROW_BUILD_VERSION 18.0.0)
+  set(VELOX_ARROW_BUILD_VERSION 23.0.1)
   set(
     VELOX_ARROW_BUILD_SHA256_CHECKSUM
-    9c473f2c9914c59ab571761c9497cf0e5cfd3ea335f7782ccc6121f5cb99ae9b
+    9a9a057bba3aa7080abc2ba8e7a079effa74626a4f308ac56bfce035d31ef1ac
   )
   set(
     VELOX_ARROW_SOURCE_URL
@@ -79,9 +76,7 @@ if(VELOX_ENABLE_ARROW)
     SOURCE_SUBDIR cpp
     CMAKE_ARGS ${ARROW_CMAKE_ARGS}
     BUILD_BYPRODUCTS ${ARROW_LIBDIR}/libarrow.a ${ARROW_LIBDIR}/libarrow_testing.a
-    PATCH_COMMAND
-      patch -p1 -i ${CMAKE_CURRENT_LIST_DIR}/cmake-compatibility.patch && patch -p1 -i
-      ${CMAKE_CURRENT_LIST_DIR}/arrow-testing-boost.patch
+    PATCH_COMMAND patch -p1 -i ${CMAKE_CURRENT_LIST_DIR}/cmake-compatibility.patch
   )
 
   add_library(arrow STATIC IMPORTED GLOBAL)

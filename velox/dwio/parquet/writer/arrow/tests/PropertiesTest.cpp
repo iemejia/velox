@@ -50,6 +50,37 @@ TEST(TestWriterProperties, Basics) {
   ASSERT_FALSE(props->pageChecksumEnabled());
 }
 
+TEST(TestWriterProperties, ContentDefinedChunking) {
+  // Off by default with default options.
+  auto defaults = WriterProperties::Builder().build();
+  ASSERT_FALSE(defaults->contentDefinedChunkingEnabled());
+  ASSERT_EQ(256 * 1024, defaults->contentDefinedChunkingOptions().minChunkSize);
+  ASSERT_EQ(
+      1024 * 1024, defaults->contentDefinedChunkingOptions().maxChunkSize);
+  ASSERT_EQ(0, defaults->contentDefinedChunkingOptions().normLevel);
+
+  // Enable and override options through the builder.
+  CdcOptions options;
+  options.minChunkSize = 8 * 1024;
+  options.maxChunkSize = 64 * 1024;
+  options.normLevel = 1;
+  auto props = WriterProperties::Builder()
+                   .enableContentDefinedChunking()
+                   ->contentDefinedChunkingOptions(options)
+                   ->build();
+  ASSERT_TRUE(props->contentDefinedChunkingEnabled());
+  ASSERT_EQ(8 * 1024, props->contentDefinedChunkingOptions().minChunkSize);
+  ASSERT_EQ(64 * 1024, props->contentDefinedChunkingOptions().maxChunkSize);
+  ASSERT_EQ(1, props->contentDefinedChunkingOptions().normLevel);
+
+  // Disable overrides a prior enable.
+  auto disabled = WriterProperties::Builder()
+                      .enableContentDefinedChunking()
+                      ->disableContentDefinedChunking()
+                      ->build();
+  ASSERT_FALSE(disabled->contentDefinedChunkingEnabled());
+}
+
 TEST(TestWriterProperties, AdvancedHandling) {
   WriterProperties::Builder Builder;
   Builder.compression("gzip", Compression::GZIP);

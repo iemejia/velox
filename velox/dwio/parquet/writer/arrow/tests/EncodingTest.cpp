@@ -136,8 +136,9 @@ class PlainEncoder : public EncoderImpl, virtual public TypedEncoder<DType> {
     if (validBits != NULLPTR) {
       auto buffer = allocateBuffer(this->memoryPool(), numValues * sizeof(T));
       T* data = reinterpret_cast<T*>(buffer->mutable_data());
-      int numValidValues = ::arrow::util::internal::SpacedCompress<T>(
-          src, numValues, validBits, validBitsOffset, data);
+      int numValidValues =
+          ::facebook::velox::parquet::arrow::util::internal::spacedCompress<T>(
+              src, numValues, validBits, validBitsOffset, data);
       put(data, numValidValues);
     } else {
       put(src, numValues);
@@ -354,8 +355,9 @@ class PlainEncoder<BooleanType> : public EncoderImpl,
     if (validBits != NULLPTR) {
       auto buffer = allocateBuffer(this->memoryPool(), numValues * sizeof(T));
       T* data = reinterpret_cast<T*>(buffer->mutable_data());
-      int numValidValues = ::arrow::util::internal::SpacedCompress<T>(
-          src, numValues, validBits, validBitsOffset, data);
+      int numValidValues =
+          ::facebook::velox::parquet::arrow::util::internal::spacedCompress<T>(
+              src, numValues, validBits, validBitsOffset, data);
       put(data, numValidValues);
     } else {
       put(src, numValues);
@@ -1032,8 +1034,9 @@ void ByteStreamSplitEncoder<DType>::putSpaced(
   if (validBits != NULLPTR) {
     auto buffer = allocateBuffer(this->memoryPool(), numValues * sizeof(T));
     T* data = reinterpret_cast<T*>(buffer->mutable_data());
-    int numValidValues = ::arrow::util::internal::SpacedCompress<T>(
-        src, numValues, validBits, validBitsOffset, data);
+    int numValidValues =
+        ::facebook::velox::parquet::arrow::util::internal::spacedCompress<T>(
+            src, numValues, validBits, validBitsOffset, data);
     put(data, numValidValues);
   } else {
     put(src, numValues);
@@ -2675,8 +2678,9 @@ void DeltaBitPackEncoder<DType>::putSpaced(
   if (validBits != NULLPTR) {
     auto buffer = allocateBuffer(this->memoryPool(), numValues * sizeof(T));
     T* data = reinterpret_cast<T*>(buffer->mutable_data());
-    int numValidValues = ::arrow::util::internal::SpacedCompress<T>(
-        src, numValues, validBits, validBitsOffset, data);
+    int numValidValues =
+        ::facebook::velox::parquet::arrow::util::internal::spacedCompress<T>(
+            src, numValues, validBits, validBitsOffset, data);
     put(data, numValidValues);
   } else {
     put(src, numValues);
@@ -3039,8 +3043,9 @@ void DeltaLengthByteArrayEncoder<DType>::putSpaced(
   if (validBits != NULLPTR) {
     auto buffer = allocateBuffer(this->memoryPool(), numValues * sizeof(T));
     T* data = reinterpret_cast<T*>(buffer->mutable_data());
-    int numValidValues = ::arrow::util::internal::SpacedCompress<T>(
-        src, numValues, validBits, validBitsOffset, data);
+    int numValidValues =
+        ::facebook::velox::parquet::arrow::util::internal::spacedCompress<T>(
+            src, numValues, validBits, validBitsOffset, data);
     put(data, numValidValues);
   } else {
     put(src, numValues);
@@ -3271,8 +3276,9 @@ class RleBooleanEncoder final : public EncoderImpl,
     if (validBits != NULLPTR) {
       auto buffer = allocateBuffer(this->memoryPool(), numValues * sizeof(T));
       T* data = reinterpret_cast<T*>(buffer->mutable_data());
-      int numValidValues = ::arrow::util::internal::SpacedCompress<T>(
-          src, numValues, validBits, validBitsOffset, data);
+      int numValidValues =
+          ::facebook::velox::parquet::arrow::util::internal::spacedCompress<T>(
+              src, numValues, validBits, validBitsOffset, data);
       put(data, numValidValues);
     } else {
       put(src, numValues);

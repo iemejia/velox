@@ -39,7 +39,7 @@ by Velox. See details on bundling below.
 | fbthrift          | v2026.01.05.00  | No       ||
 | libstemmer        | 2.2.0           | Yes      ||
 | DuckDB (testing)  | 0.8.1           | Yes      ||
-| arrow             | 15.0.0          | Yes      ||
+| arrow             | 23.0.1          | Yes      ||
 | geos              | 3.10.7          | Yes      ||
 | s2geometry        | 0.12.0          | Yes      ||
 | fast_float        | v8.0.2          | Yes      ||

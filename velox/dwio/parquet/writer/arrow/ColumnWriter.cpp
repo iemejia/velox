@@ -42,6 +42,7 @@
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/dwio/parquet/common/LevelConversion.h"
+#include "velox/dwio/parquet/writer/arrow/ChunkerInternal.h"
 #include "velox/dwio/parquet/writer/arrow/ColumnPage.h"
 #include "velox/dwio/parquet/writer/arrow/Encoding.h"
 #include "velox/dwio/parquet/writer/arrow/Encryption.h"
@@ -52,6 +53,7 @@
 #include "velox/dwio/parquet/writer/arrow/Platform.h"
 #include "velox/dwio/parquet/writer/arrow/Properties.h"
 #include "velox/dwio/parquet/writer/arrow/Schema.h"
+#include "velox/dwio/parquet/writer/arrow/SizeStatistics.h"
 #include "velox/dwio/parquet/writer/arrow/Statistics.h"
 #include "velox/dwio/parquet/writer/arrow/ThriftInternal.h"
 #include "velox/dwio/parquet/writer/arrow/Types.h"
@@ -224,7 +226,7 @@ int LevelEncoder::maxBufferSize(
     int16_t maxLevel,
     int numBufferedValues) {
   int bitWidth = ::arrow::bit_util::Log2(maxLevel + 1);
-  int numBytes = 0;
+  int64_t numBytes = 0;
   switch (encoding) {
     case Encoding::kRle: {
       // TODO: Due to the way we currently check if the buffer is full enough,
@@ -234,14 +236,19 @@ int LevelEncoder::maxBufferSize(
       break;
     }
     case Encoding::kBitPacked: {
-      numBytes = static_cast<int>(
-          ::arrow::bit_util::BytesForBits(numBufferedValues * bitWidth));
+      numBytes = ::arrow::bit_util::BytesForBits(numBufferedValues * bitWidth);
       break;
     }
     default:
       throw ParquetException("Unknown encoding type for levels.");
   }
-  return numBytes;
+  if (numBytes > std::numeric_limits<int>::max()) {
+    throw ParquetException(
+        "Maximum buffer size for LevelEncoder (",
+        numBytes,
+        ") is greater than the maximum int32 value");
+  }
+  return static_cast<int>(numBytes);
 }
 
 int LevelEncoder::encode(int batchSize, const int16_t* levels) {
@@ -318,6 +325,11 @@ class SerializedPageWriter : public PageWriter {
 
   int64_t writeDictionaryPage(const DictionaryPage& page) override {
     int64_t uncompressedSize = page.size();
+    if (uncompressedSize > std::numeric_limits<int32_t>::max()) {
+      throw ParquetException(
+          "Uncompressed dictionary page size overflows INT32_MAX. Size:",
+          uncompressedSize);
+    }
     std::shared_ptr<Buffer> compressedData;
     if (hasCompressor()) {
       auto buffer = std::static_pointer_cast<ResizableBuffer>(
@@ -334,6 +346,11 @@ class SerializedPageWriter : public PageWriter {
     dict_page_header.is_sorted() = page.isSorted();
 
     const uint8_t* outputDataBuffer = compressedData->data();
+    if (compressedData->size() > std::numeric_limits<int32_t>::max()) {
+      throw ParquetException(
+          "Compressed dictionary page size overflows INT32_MAX. Size:",
+          compressedData->size());
+    }
     int32_t outputDataLen = static_cast<int32_t>(compressedData->size());
 
     if (dataEncryptor_.get()) {
@@ -431,8 +448,18 @@ class SerializedPageWriter : public PageWriter {
 
   int64_t writeDataPage(const DataPage& page) override {
     const int64_t uncompressedSize = page.uncompressedSize();
+    if (uncompressedSize > std::numeric_limits<int32_t>::max()) {
+      throw ParquetException(
+          "Uncompressed data page size overflows INT32_MAX. Size:",
+          uncompressedSize);
+    }
     std::shared_ptr<Buffer> compressedData = page.buffer();
     const uint8_t* outputDataBuffer = compressedData->data();
+    if (compressedData->size() > std::numeric_limits<int32_t>::max()) {
+      throw ParquetException(
+          "Compressed data page size overflows INT32_MAX. Size:",
+          compressedData->size());
+    }
     int32_t outputDataLen = static_cast<int32_t>(compressedData->size());
 
     if (dataEncryptor_.get()) {
@@ -481,7 +508,7 @@ class SerializedPageWriter : public PageWriter {
 
     /// Collect page index.
     if (columnIndexBuilder_ != nullptr) {
-      columnIndexBuilder_->addPage(page.statistics());
+      columnIndexBuilder_->addPage(page.statistics(), page.sizeStatistics());
     }
     if (offsetIndexBuilder_ != nullptr) {
       const int64_t compressedSize = outputDataLen + headerSize;
@@ -497,7 +524,8 @@ class SerializedPageWriter : public PageWriter {
       offsetIndexBuilder_->addPage(
           startPos,
           static_cast<int32_t>(compressedSize),
-          *page.firstRowIndex());
+          *page.firstRowIndex(),
+          page.sizeStatistics().unencodedByteArrayDataBytes);
     }
 
     totalUncompressedSize_ += uncompressedSize + headerSize;
@@ -924,6 +952,27 @@ class ColumnWriterImpl {
       compressorTempBuffer_ = std::static_pointer_cast<ResizableBuffer>(
           allocateBuffer(allocator_, 0));
     }
+
+    if (properties_->sizeStatisticsLevel() != SizeStatisticsLevel::kNone) {
+      chunkSizeStatistics_ = SizeStatistics::make(descr_);
+    }
+    if (descr_->logicalType() != nullptr &&
+        descr_->logicalType()->isGeometry()) {
+      chunkGeospatialStatistics_ =
+          std::make_shared<geospatial::GeoStatistics>();
+    }
+    if (properties_->contentDefinedChunkingEnabled()) {
+      auto cdcOptions = properties_->contentDefinedChunkingOptions();
+      contentDefinedChunker_.emplace(
+          levelInfo_,
+          cdcOptions.minChunkSize,
+          cdcOptions.maxChunkSize,
+          cdcOptions.normLevel);
+    }
+    if (properties_->sizeStatisticsLevel() ==
+        SizeStatisticsLevel::kPageAndColumnChunk) {
+      pageSizeStatistics_ = SizeStatistics::make(descr_);
+    }
   }
 
   virtual ~ColumnWriterImpl() = default;
@@ -967,10 +1016,39 @@ class ColumnWriterImpl {
   }
 
   // Write multiple definition levels.
+  static void accumulateDefinitionHistogram(
+      SizeStatistics* stats,
+      int64_t numLevels,
+      const int16_t* levels) {
+    if (stats != nullptr && !stats->definitionLevelHistogram.empty()) {
+      updateLevelHistogram(
+          levels,
+          numLevels,
+          stats->definitionLevelHistogram.data(),
+          static_cast<int64_t>(stats->definitionLevelHistogram.size()));
+    }
+  }
+
+  static void accumulateRepetitionHistogram(
+      SizeStatistics* stats,
+      int64_t numLevels,
+      const int16_t* levels) {
+    if (stats != nullptr && !stats->repetitionLevelHistogram.empty()) {
+      updateLevelHistogram(
+          levels,
+          numLevels,
+          stats->repetitionLevelHistogram.data(),
+          static_cast<int64_t>(stats->repetitionLevelHistogram.size()));
+    }
+  }
+
   void writeDefinitionLevels(int64_t numLevels, const int16_t* levels) {
     VELOX_DCHECK(!closed_);
     PARQUET_THROW_NOT_OK(
         definitionLevelsSink_.Append(levels, sizeof(int16_t) * numLevels));
+    accumulateDefinitionHistogram(
+        chunkSizeStatistics_.get(), numLevels, levels);
+    accumulateDefinitionHistogram(pageSizeStatistics_.get(), numLevels, levels);
   }
 
   // Write multiple repetition levels.
@@ -978,6 +1056,20 @@ class ColumnWriterImpl {
     VELOX_DCHECK(!closed_);
     PARQUET_THROW_NOT_OK(
         repetitionLevelsSink_.Append(levels, sizeof(int16_t) * numLevels));
+    accumulateRepetitionHistogram(
+        chunkSizeStatistics_.get(), numLevels, levels);
+    accumulateRepetitionHistogram(pageSizeStatistics_.get(), numLevels, levels);
+  }
+
+  // Snapshots the current page's size statistics and resets the accumulator for
+  // the next page. Returns an empty value when page statistics are disabled.
+  SizeStatistics takePageSizeStatistics() {
+    if (pageSizeStatistics_ == nullptr) {
+      return SizeStatistics();
+    }
+    SizeStatistics snapshot = *pageSizeStatistics_;
+    pageSizeStatistics_->reset();
+    return snapshot;
   }
 
   // RLE encode the src_buffer into dest_buffer and return the encoded size.
@@ -1039,6 +1131,16 @@ class ColumnWriterImpl {
 
   // Flag to infer if dictionary encoding has fallen back to PLAIN.
   bool fallback_;
+
+  // Accumulated size statistics for the whole column chunk, or null when size
+  // statistics collection is disabled.
+  std::unique_ptr<SizeStatistics> chunkSizeStatistics_;
+  std::shared_ptr<geospatial::GeoStatistics> chunkGeospatialStatistics_;
+  std::optional<internal::ContentDefinedChunker> contentDefinedChunker_;
+
+  // Accumulated size statistics for the current data page, or null unless
+  // page-level statistics are enabled. Reset after each page is built.
+  std::unique_ptr<SizeStatistics> pageSizeStatistics_;
 
   ::arrow::BufferBuilder definitionLevelsSink_;
   ::arrow::BufferBuilder repetitionLevelsSink_;
@@ -1205,7 +1307,8 @@ void ColumnWriterImpl::buildDataPageV1(
         Encoding::kRle,
         uncompressedSize,
         pageStats,
-        firstRowIndex);
+        firstRowIndex,
+        takePageSizeStatistics());
     totalCompressedBytes_ +=
         pagePtr->size() + sizeof(facebook::velox::parquet::thrift::PageHeader);
 
@@ -1219,7 +1322,8 @@ void ColumnWriterImpl::buildDataPageV1(
         Encoding::kRle,
         uncompressedSize,
         pageStats,
-        firstRowIndex);
+        firstRowIndex,
+        takePageSizeStatistics());
     writeDataPage(page);
   }
 }
@@ -1284,7 +1388,8 @@ void ColumnWriterImpl::buildDataPageV2(
         uncompressedSize,
         pager_->hasCompressor(),
         pageStats,
-        firstRowIndex);
+        firstRowIndex,
+        takePageSizeStatistics());
     totalCompressedBytes_ +=
         pagePtr->size() + sizeof(facebook::velox::parquet::thrift::PageHeader);
     dataPages_.push_back(std::move(pagePtr));
@@ -1300,7 +1405,8 @@ void ColumnWriterImpl::buildDataPageV2(
         uncompressedSize,
         pager_->hasCompressor(),
         pageStats,
-        firstRowIndex);
+        firstRowIndex,
+        takePageSizeStatistics());
     writeDataPage(page);
   }
 }
@@ -1322,6 +1428,17 @@ int64_t ColumnWriterImpl::close() {
     // Write stats only if the column has at least one row written.
     if (rowsWritten_ > 0 && chunkStatistics.isSet()) {
       metadata_->setStatistics(chunkStatistics);
+    }
+    if (rowsWritten_ > 0 && chunkSizeStatistics_ &&
+        chunkSizeStatistics_->isSet()) {
+      metadata_->setSizeStatistics(*chunkSizeStatistics_);
+    }
+    if (rowsWritten_ > 0 && chunkGeospatialStatistics_ != nullptr) {
+      std::optional<geospatial::EncodedGeoStatistics> geoStats =
+          chunkGeospatialStatistics_->Encode();
+      if (geoStats.has_value()) {
+        metadata_->setGeospatialStatistics(*geoStats);
+      }
     }
     pager_->close(hasDictionary_, fallback_);
   }
@@ -1493,6 +1610,11 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
       const int16_t* defLevels,
       const int16_t* repLevels,
       const T* values) override {
+    if (ARROW_PREDICT_FALSE(properties_->contentDefinedChunkingEnabled())) {
+      throw ParquetException(
+          "Content-defined chunking is not supported in writeBatch() or "
+          "writeBatchSpaced(), use writeArrow() instead.");
+    }
     // We check for DataPage limits only after we have inserted the values. If
     // a user writes a large number of values, the DataPage size can be much
     // above the limit. The purpose of this chunking is to bound this. Even if
@@ -1537,6 +1659,11 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
       const uint8_t* validBits,
       int64_t validBitsOffset,
       const T* values) override {
+    if (ARROW_PREDICT_FALSE(properties_->contentDefinedChunkingEnabled())) {
+      throw ParquetException(
+          "Content-defined chunking is not supported in writeBatch() or "
+          "writeBatchSpaced(), use writeArrow() instead.");
+    }
     // Like WriteBatch, but for spaced values.
     int64_t valueOffset = 0;
     auto writeChunk = [&](int64_t offset, int64_t batchSize, bool checkPage) {
@@ -1598,6 +1725,12 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
       ArrowWriteContext* ctx,
       bool leafFieldNullable) override {
     BEGIN_PARQUET_CATCH_EXCEPTIONS
+    if (!leafFieldNullable && leafArray.null_count() != 0) {
+      return ::arrow::Status::Invalid(
+          "Column '",
+          descr_->name(),
+          "' is declared non-nullable but contains nulls");
+    }
     // Leaf nulls are canonical when there is only a single null element after
     // a list and it is at the leaf.
     bool singleNullableElement =
@@ -1612,6 +1745,44 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
               ::arrow::bit_util::BytesForBits(properties_->writeBatchSize()),
               ctx->memoryPool));
       bitsBuffer_->ZeroPadding();
+    }
+
+    if (contentDefinedChunker_.has_value()) {
+      // Split the input at content-defined chunk boundaries and flush a data
+      // page at each boundary, so identical data yields identical byte
+      // sequences across files (content-addressable dedup). The last chunk does
+      // not force a new page, letting a subsequent writeArrow() continue the
+      // current page; the chunker's rolling state is not reset between calls.
+      auto chunks = contentDefinedChunker_->GetChunks(
+          defLevels, repLevels, numLevels, leafArray);
+      for (size_t i = 0; i < chunks.size(); i++) {
+        const auto& chunk = chunks[i];
+        auto chunkArray = leafArray.Slice(chunk.value_offset);
+        auto chunkDefLevels = addIfNotNull(defLevels, chunk.level_offset);
+        auto chunkRepLevels = addIfNotNull(repLevels, chunk.level_offset);
+        if (leafArray.type()->id() == ::arrow::Type::DICTIONARY) {
+          ARROW_RETURN_NOT_OK(writeArrowDictionary(
+              chunkDefLevels,
+              chunkRepLevels,
+              chunk.levels_to_write,
+              *chunkArray,
+              ctx,
+              maybeParentNulls));
+        } else {
+          ARROW_RETURN_NOT_OK(writeArrowDense(
+              chunkDefLevels,
+              chunkRepLevels,
+              chunk.levels_to_write,
+              *chunkArray,
+              ctx,
+              maybeParentNulls));
+        }
+        const bool isLastChunk = i == (chunks.size() - 1);
+        if (numBufferedValues_ > 0 && !isLastChunk) {
+          addDataPage();
+        }
+      }
+      return ::arrow::Status::OK();
     }
 
     if (leafArray.type()->id() == ::arrow::Type::DICTIONARY) {
@@ -1949,6 +2120,52 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
     if (pageStatistics_ != nullptr) {
       pageStatistics_->update(values, numValues, numNulls);
     }
+    updateUnencodedByteArrayDataBytes(
+        values, numValues, numValues, /*validBits=*/nullptr, 0);
+    if constexpr (std::is_same_v<T, ByteArray>) {
+      if (chunkGeospatialStatistics_ != nullptr) {
+        chunkGeospatialStatistics_->Update(values, numValues);
+      }
+    }
+  }
+
+  // Accumulates the unencoded BYTE_ARRAY data bytes (excluding the length
+  // prefix) into the column-chunk size statistics. A no-op for other types.
+  void updateUnencodedByteArrayDataBytes(
+      const T* values,
+      int64_t numValues,
+      int64_t numSpacedValues,
+      const uint8_t* validBits,
+      int64_t validBitsOffset) {
+    if constexpr (std::is_same_v<T, ByteArray>) {
+      const bool chunkWants = chunkSizeStatistics_ != nullptr &&
+          chunkSizeStatistics_->unencodedByteArrayDataBytes.has_value();
+      const bool pageWants = pageSizeStatistics_ != nullptr &&
+          pageSizeStatistics_->unencodedByteArrayDataBytes.has_value();
+      if (!chunkWants && !pageWants) {
+        return;
+      }
+      int64_t bytes = 0;
+      if (validBits == nullptr || numValues == numSpacedValues) {
+        // Values are packed with no nulls.
+        for (int64_t i = 0; i < numValues; ++i) {
+          bytes += values[i].len;
+        }
+      } else {
+        // Values are spaced; only sum the non-null (valid) positions.
+        for (int64_t i = 0; i < numSpacedValues; ++i) {
+          if (::arrow::bit_util::GetBit(validBits, validBitsOffset + i)) {
+            bytes += values[i].len;
+          }
+        }
+      }
+      if (chunkWants) {
+        chunkSizeStatistics_->incrementUnencodedByteArrayDataBytes(bytes);
+      }
+      if (pageWants) {
+        pageSizeStatistics_->incrementUnencodedByteArrayDataBytes(bytes);
+      }
+    }
   }
 
   /// \brief Write values with spaces and update page statistics accordingly.
@@ -1989,6 +2206,14 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
           numSpacedValues,
           numValues,
           numNulls);
+    }
+    updateUnencodedByteArrayDataBytes(
+        values, numValues, numSpacedValues, validBits, validBitsOffset);
+    if constexpr (std::is_same_v<T, ByteArray>) {
+      if (chunkGeospatialStatistics_ != nullptr) {
+        chunkGeospatialStatistics_->UpdateSpaced(
+            values, validBits, validBitsOffset, numSpacedValues, numValues);
+      }
     }
   }
 };

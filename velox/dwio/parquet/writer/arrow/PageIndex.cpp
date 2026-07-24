@@ -24,6 +24,7 @@
 #include "velox/dwio/parquet/writer/arrow/Exception.h"
 #include "velox/dwio/parquet/writer/arrow/Metadata.h"
 #include "velox/dwio/parquet/writer/arrow/Schema.h"
+#include "velox/dwio/parquet/writer/arrow/SizeStatistics.h"
 #include "velox/dwio/parquet/writer/arrow/Statistics.h"
 #include "velox/dwio/parquet/writer/arrow/ThriftInternal.h"
 #include "velox/dwio/parquet/writer/arrow/util/OverflowUtilInternal.h"
@@ -513,7 +514,9 @@ class ColumnIndexBuilderImpl final : public ColumnIndexBuilder {
         facebook::velox::parquet::thrift::BoundaryOrder::UNORDERED;
   }
 
-  void addPage(const EncodedStatistics& stats) override {
+  void addPage(
+      const EncodedStatistics& stats,
+      const SizeStatistics& sizeStatistics) override {
     if (state_ == BuilderState::kFinished) {
       throw ParquetException("Cannot add page to finished ColumnIndexBuilder.");
     } else if (state_ == BuilderState::kDiscarded) {
@@ -544,6 +547,22 @@ class ColumnIndexBuilderImpl final : public ColumnIndexBuilder {
       columnIndex_.null_counts()->emplace_back(stats.nullCount);
     } else {
       columnIndex_.null_counts().reset();
+    }
+
+    /// Concatenate this page's level histograms into the column index.
+    if (!sizeStatistics.definitionLevelHistogram.empty()) {
+      auto& histogram = columnIndex_.definition_level_histograms().ensure();
+      histogram.insert(
+          histogram.end(),
+          sizeStatistics.definitionLevelHistogram.cbegin(),
+          sizeStatistics.definitionLevelHistogram.cend());
+    }
+    if (!sizeStatistics.repetitionLevelHistogram.empty()) {
+      auto& histogram = columnIndex_.repetition_level_histograms().ensure();
+      histogram.insert(
+          histogram.end(),
+          sizeStatistics.repetitionLevelHistogram.cbegin(),
+          sizeStatistics.repetitionLevelHistogram.cend());
     }
   }
 
@@ -663,7 +682,9 @@ class OffsetIndexBuilderImpl final : public OffsetIndexBuilder {
   void addPage(
       int64_t offset,
       int32_t compressedPageSize,
-      int64_t firstRowIndex) override {
+      int64_t firstRowIndex,
+      std::optional<int64_t> unencodedByteArrayDataBytes =
+          std::nullopt) override {
     if (state_ == BuilderState::kFinished) {
       throw ParquetException("Cannot add page to finished OffsetIndexBuilder.");
     } else if (state_ == BuilderState::kDiscarded) {
@@ -678,6 +699,11 @@ class OffsetIndexBuilderImpl final : public OffsetIndexBuilder {
     page_location.compressed_page_size() = compressedPageSize;
     page_location.first_row_index() = firstRowIndex;
     offsetIndex_.page_locations()->emplace_back(std::move(page_location));
+
+    if (unencodedByteArrayDataBytes.has_value()) {
+      offsetIndex_.unencoded_byte_array_data_bytes().ensure().push_back(
+          unencodedByteArrayDataBytes.value());
+    }
   }
 
   void finish(int64_t finalPosition) override {

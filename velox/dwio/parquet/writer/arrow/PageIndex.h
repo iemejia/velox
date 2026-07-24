@@ -28,6 +28,7 @@ namespace facebook::velox::parquet::arrow {
 
 class ColumnDescriptor;
 class EncodedStatistics;
+struct SizeStatistics;
 class FileMetaData;
 class InternalFileDecryptor;
 struct PageIndexLocation;
@@ -290,7 +291,11 @@ class PARQUET_EXPORT ColumnIndexBuilder {
   /// not update statistics any more.
   ///
   /// \param stats Page statistics in the encoded form.
-  virtual void addPage(const EncodedStatistics& stats) = 0;
+  /// \param sizeStatistics Page size statistics whose level histograms are
+  /// concatenated into the column index.
+  virtual void addPage(
+      const EncodedStatistics& stats,
+      const SizeStatistics& sizeStatistics) = 0;
 
   /// \brief Complete the column index.
   ///
@@ -323,10 +328,13 @@ class PARQUET_EXPORT OffsetIndexBuilder {
   virtual ~OffsetIndexBuilder() = default;
 
   /// \brief Add page location of a data page.
+  /// \param unencodedByteArrayDataBytes Unencoded BYTE_ARRAY data bytes for the
+  /// page, appended to the offset index when present.
   virtual void addPage(
       int64_t offset,
       int32_t compressedPageSize,
-      int64_t firstRowIndex) = 0;
+      int64_t firstRowIndex,
+      std::optional<int64_t> unencodedByteArrayDataBytes = std::nullopt) = 0;
 
   /// \brief Add page location of a data page.
   void addPage(const PageLocation& pageLocation) {

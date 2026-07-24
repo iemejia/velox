@@ -31,6 +31,7 @@
 #include "velox/dwio/parquet/writer/arrow/Metadata.h"
 #include "velox/dwio/parquet/writer/arrow/Platform.h"
 #include "velox/dwio/parquet/writer/arrow/Properties.h"
+#include "velox/dwio/parquet/writer/arrow/SizeStatistics.h"
 #include "velox/dwio/parquet/writer/arrow/Statistics.h"
 #include "velox/dwio/parquet/writer/arrow/ThriftInternal.h"
 #include "velox/dwio/parquet/writer/arrow/Types.h"
@@ -104,10 +105,12 @@ class TestPrimitiveWriter : public PrimitiveTypedTest<TestType> {
       int64_t outputSize = SMALL_SIZE,
       const ColumnProperties& columnProps = ColumnProperties(),
       const ParquetVersion::type version = ParquetVersion::PARQUET_1_0,
-      bool enableChecksum = false) {
+      bool enableChecksum = false,
+      SizeStatisticsLevel sizeStatisticsLevel = SizeStatisticsLevel::kNone) {
     sink_ = createOutputStream();
     WriterProperties::Builder wpBuilder;
     wpBuilder.version(version);
+    wpBuilder.sizeStatisticsLevel(sizeStatisticsLevel);
     if (columnProps.encoding() == Encoding::kPlainDictionary ||
         columnProps.encoding() == Encoding::kRleDictionary) {
       wpBuilder.enableDictionary();
@@ -381,6 +384,16 @@ class TestPrimitiveWriter : public PrimitiveTypedTest<TestType> {
     return {encodedStats.hasMin, encodedStats.hasMax};
   }
 
+  std::shared_ptr<SizeStatistics> metadataSizeStatistics() {
+    ApplicationVersion appVersion(this->writerProperties_->createdBy());
+    auto metadataAccessor = ColumnChunkMetaData::make(
+        metadata_->Contents(),
+        this->descr_,
+        defaultReaderProperties(),
+        &appVersion);
+    return metadataAccessor->sizeStatistics();
+  }
+
   std::vector<Encoding::type> metadataEncodings() {
     // Metadata accessor must be created lazily.
     // This is because the ColumnChunkMetaData semantics dictate the metadata.
@@ -545,6 +558,35 @@ TEST_F(TestByteArrayValuesWriter, RequiredDeltaLengthByteArray) {
   this->testRequiredWithEncoding(Encoding::kDeltaLengthByteArray);
 }
 
+// Collects the unencoded BYTE_ARRAY data byte count for a required column and
+// reads it back from the column metadata.
+TEST_F(TestByteArrayValuesWriter, RequiredColumnChunkUnencodedBytes) {
+  this->setUpSchema(Repetition::kRequired);
+  this->generateData(SMALL_SIZE);
+
+  int64_t expectedBytes = 0;
+  for (const auto& value : this->values_) {
+    expectedBytes += value.len;
+  }
+
+  auto writer = this->buildWriter(
+      SMALL_SIZE,
+      ColumnProperties(),
+      ParquetVersion::PARQUET_1_0,
+      /*enableChecksum=*/false,
+      SizeStatisticsLevel::kColumnChunk);
+  writer->writeBatch(this->values_.size(), nullptr, nullptr, this->valuesPtr_);
+  writer->close();
+
+  auto sizeStatistics = this->metadataSizeStatistics();
+  ASSERT_NE(sizeStatistics, nullptr);
+  ASSERT_TRUE(sizeStatistics->unencodedByteArrayDataBytes.has_value());
+  EXPECT_EQ(sizeStatistics->unencodedByteArrayDataBytes.value(), expectedBytes);
+  // A required, non-nested column has no level histograms.
+  EXPECT_TRUE(sizeStatistics->definitionLevelHistogram.empty());
+  EXPECT_TRUE(sizeStatistics->repetitionLevelHistogram.empty());
+}
+
 /*
 TYPED_TEST(TestByteArrayValuesWriter, RequiredDeltaByteArray) {
   this->TestRequiredWithEncoding(Encoding::DELTA_BYTE_ARRAY);
@@ -656,6 +698,36 @@ TYPED_TEST(TestPrimitiveWriter, Optional) {
   ASSERT_EQ(this->values_, this->valuesOut_);
 }
 
+// Collects column-chunk level size statistics for an optional column and reads
+// the definition level histogram back from the column metadata.
+TYPED_TEST(TestPrimitiveWriter, OptionalColumnChunkSizeStatistics) {
+  this->setUpSchema(Repetition::kOptional);
+
+  this->generateData(SMALL_SIZE);
+  std::vector<int16_t> definitionLevels(SMALL_SIZE, 1);
+  definitionLevels[1] = 0;
+
+  auto writer = this->buildWriter(
+      SMALL_SIZE,
+      ColumnProperties(),
+      ParquetVersion::PARQUET_1_0,
+      /*enableChecksum=*/false,
+      SizeStatisticsLevel::kColumnChunk);
+  writer->writeBatch(
+      this->values_.size(), definitionLevels.data(), nullptr, this->valuesPtr_);
+  writer->close();
+
+  auto sizeStatistics = this->metadataSizeStatistics();
+  ASSERT_NE(sizeStatistics, nullptr);
+  // Max definition level is 1, so the histogram has two buckets: one null and
+  // the rest non-null.
+  ASSERT_EQ(sizeStatistics->definitionLevelHistogram.size(), 2u);
+  EXPECT_EQ(sizeStatistics->definitionLevelHistogram[0], 1);
+  EXPECT_EQ(sizeStatistics->definitionLevelHistogram[1], SMALL_SIZE - 1);
+  // Max repetition level is 0, so no repetition histogram is written.
+  EXPECT_TRUE(sizeStatistics->repetitionLevelHistogram.empty());
+}
+
 TYPED_TEST(TestPrimitiveWriter, OptionalSpaced) {
   // Optional and non-repeated, with definition levels.
   // But no repetition levels.
@@ -740,6 +812,39 @@ TYPED_TEST(TestPrimitiveWriter, dictionaryfallbackversion10) {
 TYPED_TEST(TestPrimitiveWriter, dictionaryfallbackversion20) {
   this->testDictionaryFallbackEncoding(ParquetVersion::PARQUET_2_4);
   this->testDictionaryFallbackEncoding(ParquetVersion::PARQUET_2_6);
+}
+
+// Round-trips nanoseconds to the Impala INT96 encoding and back, covering
+// pre-1970 timestamps where a naive modulo would produce a negative
+// intra-day remainder. Mirrors Apache Arrow's TestImpalaConversion
+// (apache/arrow GH-48246).
+TEST(TestImpalaConversion, arrowTimestampToImpalaTimestamp) {
+  const std::vector<std::pair<int64_t, Int96>> testCases = {
+      // June 20, 2017 16:32:56 and 123456789 nanoseconds.
+      {INT64_C(1497976376123456789),
+       {{UINT32_C(632093973), UINT32_C(13871), UINT32_C(2457925)}}},
+      // January 1, 1970 00:00:00 and 000000000 nanoseconds.
+      {INT64_C(0), {{UINT32_C(0), UINT32_C(0), UINT32_C(2440588)}}},
+      // December 31, 1969 23:59:59 and 999999000 nanoseconds.
+      {INT64_C(-1000),
+       {{UINT32_C(2437872664), UINT32_C(20116), UINT32_C(2440587)}}},
+      // December 31, 1969 00:00:00 and 000000000 nanoseconds.
+      {INT64_C(-86400000000000),
+       {{UINT32_C(0), UINT32_C(0), UINT32_C(2440587)}}},
+      // January 1, 1970 00:00:00 and 000001000 nanoseconds.
+      {INT64_C(1000), {{UINT32_C(1000), UINT32_C(0), UINT32_C(2440588)}}},
+      // January 2, 1970 00:00:00 and 000000000 nanoseconds.
+      {INT64_C(86400000000000),
+       {{UINT32_C(0), UINT32_C(0), UINT32_C(2440589)}}},
+  };
+
+  for (const auto& [timestamp, impalaTimestamp] : testCases) {
+    EXPECT_EQ(timestamp, int96GetNanoSeconds(impalaTimestamp));
+
+    Int96 calculated;
+    internal::nanosecondsToImpalaTimestamp(timestamp, &calculated);
+    EXPECT_EQ(impalaTimestamp, calculated);
+  }
 }
 
 TEST(TestWriter, NullValuesBuffer) {
@@ -950,7 +1055,8 @@ TEST(TestColumnWriter, RepeatedListsUpdateSpacedBug) {
   std::shared_ptr<Buffer> validBits;
   ASSERT_OK_AND_ASSIGN(
       validBits,
-      ::arrow::internal::BytesToBits({1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1}));
+      ::arrow::internal::BytesToBits(
+          std::vector<uint8_t>{1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1}));
 
   // Valgrind will warn about out of bounds access into def_levels_data.
   typedWriter->writeBatchSpaced(

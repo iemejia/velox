@@ -240,9 +240,65 @@ struct Statistics {
     * Values are encoded using PLAIN encoding, except that variable-length byte
     * arrays do not include a length prefix.
     */
-  5: optional binary max_value;
-  6: optional binary min_value;
+   5: optional binary max_value;
+   6: optional binary min_value;
 }
+
+/**
+ * A structure for capturing metadata for estimating the unencoded,
+ * uncompressed size of data written. This is useful for readers to estimate
+ * how much memory is needed to reconstruct data in their memory model and for
+ * fine-grained filter pushdown on nested structures (the histograms contained
+ * in this structure can help determine the number of nulls at a particular
+ * nesting level and maximum length of lists).
+ */
+struct SizeStatistics {
+   /**
+    * The number of physical bytes stored for BYTE_ARRAY data values assuming
+    * no encoding. This is exclusive of the bytes needed to store the length of
+    * each byte array. This field should only be set for types that use
+    * BYTE_ARRAY as their physical type.
+    */
+   1: optional i64 unencoded_byte_array_data_bytes;
+   /**
+    * When present, there is expected to be one element corresponding to each
+    * repetition (i.e. size=max repetition_level+1) where each element
+    * represents the number of times the repetition level was observed in the
+    * data. This field may be omitted if max_repetition_level is 0 without loss
+    * of information.
+    */
+   2: optional list<i64> repetition_level_histogram;
+   /**
+    * Same as repetition_level_histogram except for definition levels. This
+    * field may be omitted if max_definition_level is 0 or 1 without loss of
+    * information.
+    */
+    3: optional list<i64> definition_level_histogram;
+}
+
+/**
+ * Bounding box for GEOMETRY or GEOGRAPHY type, as min/max coordinate pairs on
+ * each axis.
+ */
+struct BoundingBox {
+  1: required double xmin;
+  2: required double xmax;
+  3: required double ymin;
+  4: required double ymax;
+  5: optional double zmin;
+  6: optional double zmax;
+  7: optional double mmin;
+  8: optional double mmax;
+}
+
+/** Statistics specific to Geometry and Geography logical types. */
+struct GeospatialStatistics {
+  // A bounding box of geospatial instances.
+  1: optional BoundingBox bbox;
+  // Geospatial type codes of all instances, or an empty list if not known.
+  2: optional list<i32> geospatial_types;
+}
+
 
 /** Empty structs to use as logical type annotations */
 struct StringType {} // allowed for BINARY, must be encoded with UTF-8
@@ -330,6 +386,52 @@ struct JsonType {}
  */
 struct BsonType {}
 
+// Allowed for physical type FIXED[2], stored as raw FLOAT16 bytes.
+struct Float16Type {}
+
+/**
+ * Embedded Variant logical type annotation.
+ *
+ * Allowed for physical type: group with value and optional metadata columns.
+ */
+struct VariantType {
+  // The version of the variant specification the variant was written with.
+  1: optional byte specification_version;
+}
+
+// Edge interpolation algorithm for the Geography logical type.
+enum EdgeInterpolationAlgorithm {
+  SPHERICAL = 0,
+  VINCENTY = 1,
+  THOMAS = 2,
+  ANDOYER = 3,
+  KARNEY = 4,
+}
+
+/**
+ * Embedded Geometry logical type annotation.
+ *
+ * Geospatial features in the Well-Known Binary (WKB) format with linear/planar
+ * edges interpolation. A custom CRS can be set by crs; if unset it defaults to
+ * "OGC:CRS84". Allowed for physical type: BYTE_ARRAY.
+ */
+struct GeometryType {
+  1: optional string crs;
+}
+
+/**
+ * Embedded Geography logical type annotation.
+ *
+ * Geospatial features in the WKB format with an explicit, non-linear edges
+ * interpolation algorithm. A custom geographic CRS can be set by crs; if unset
+ * it defaults to "OGC:CRS84". The algorithm defaults to SPHERICAL if unset.
+ * Allowed for physical type: BYTE_ARRAY.
+ */
+struct GeographyType {
+  1: optional string crs;
+  2: optional EdgeInterpolationAlgorithm algorithm;
+}
+
 /**
  * LogicalType annotations to replace ConvertedType.
  *
@@ -359,6 +461,10 @@ union LogicalType {
   12: JsonType JSON; // use ConvertedType JSON
   13: BsonType BSON; // use ConvertedType BSON
   14: UUIDType UUID;
+  15: Float16Type FLOAT16; // no compatible ConvertedType
+  16: VariantType VARIANT; // no compatible ConvertedType
+  17: GeometryType GEOMETRY; // no compatible ConvertedType
+  18: GeographyType GEOGRAPHY; // no compatible ConvertedType
 }
 
 /**
@@ -767,6 +873,15 @@ struct ColumnMetaData {
 
   /** Byte offset from beginning of file to Bloom filter data. **/
   14: optional i64 bloom_filter_offset;
+
+  /**
+   * Optional statistics to help estimate total memory when converted to
+   * in-memory representations. The histograms contained in these statistics can
+   * also be useful in some cases for more fine-grained nullability/list length
+   * filter pushdown.
+   */
+  16: optional SizeStatistics size_statistics;
+  17: optional GeospatialStatistics geospatial_statistics;
 }
 
 struct EncryptionWithFooterKey {}
@@ -932,6 +1047,14 @@ struct OffsetIndex {
    * that page_locations[i].first_row_index < page_locations[i+1].first_row_index.
    */
   1: list<PageLocation> page_locations;
+
+  /**
+   * Unencoded/uncompressed size of the data in the page for BYTE_ARRAY
+   * physical type. See the documentation for unencoded_byte_array_data_bytes
+   * in SizeStatistics for more details. When present, there is one element per
+   * page.
+   */
+  2: optional list<i64> unencoded_byte_array_data_bytes;
 }
 
 /**
@@ -970,6 +1093,21 @@ struct ColumnIndex {
 
   /** A list containing the number of null values for each page **/
   5: optional list<i64> null_counts;
+
+  /**
+   * Contains repetition level histograms for each page concatenated together.
+   * The repetition_level_histogram field on SizeStatistics contains more
+   * details. When present the length should always be
+   * (number of pages * (max_repetition_level + 1)).
+   */
+  6: optional list<i64> repetition_level_histograms;
+
+  /**
+   * Same as repetition_level_histograms except for definition levels. When
+   * present the length should always be
+   * (number of pages * (max_definition_level + 1)).
+   */
+  7: optional list<i64> definition_level_histograms;
 }
 
 struct AesGcmV1 {

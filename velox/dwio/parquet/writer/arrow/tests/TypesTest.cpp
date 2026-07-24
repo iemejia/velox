@@ -223,4 +223,46 @@ TEST(TestInt96Timestamp, timestampConventions) {
 #pragma warning(pop)
 #endif
 
+TEST(LogicalTypeTest, arrow23NewTypesRoundTrip) {
+  // Float16: physical FIXED_LEN_BYTE_ARRAY(2), no ConvertedType.
+  {
+    auto type = LogicalType::float16();
+    EXPECT_TRUE(type->isFloat16());
+    EXPECT_TRUE(type->isApplicable(Type::kFixedLenByteArray, 2));
+    EXPECT_FALSE(type->isApplicable(Type::kFixedLenByteArray, 3));
+    auto roundTrip = LogicalType::fromThrift(type->toThrift());
+    EXPECT_TRUE(roundTrip->isFloat16());
+    EXPECT_TRUE(roundTrip->equals(*type));
+  }
+
+  // Variant: spec version carried through thrift.
+  {
+    auto type = LogicalType::variant(/*specVersion=*/1);
+    EXPECT_TRUE(type->isVariant());
+    auto roundTrip = LogicalType::fromThrift(type->toThrift());
+    EXPECT_TRUE(roundTrip->isVariant());
+  }
+
+  // Geometry: BYTE_ARRAY (WKB), custom CRS round-trips.
+  {
+    auto type = LogicalType::geometry("OGC:CRS84");
+    EXPECT_TRUE(type->isGeometry());
+    EXPECT_TRUE(type->isApplicable(Type::kByteArray));
+    auto roundTrip = LogicalType::fromThrift(type->toThrift());
+    ASSERT_TRUE(roundTrip->isGeometry());
+    EXPECT_TRUE(roundTrip->equals(*type));
+  }
+
+  // Geography: BYTE_ARRAY (WKB), non-default edge algorithm round-trips.
+  {
+    auto type = LogicalType::geography(
+        "OGC:CRS84", LogicalType::EdgeInterpolationAlgorithm::kVincenty);
+    EXPECT_TRUE(type->isGeography());
+    EXPECT_TRUE(type->isApplicable(Type::kByteArray));
+    auto roundTrip = LogicalType::fromThrift(type->toThrift());
+    ASSERT_TRUE(roundTrip->isGeography());
+    EXPECT_TRUE(roundTrip->equals(*type));
+  }
+}
+
 } // namespace facebook::velox::parquet::arrow
