@@ -902,7 +902,8 @@ PARQUET_EXPORT std::string typeToString(Type::type t);
 
 PARQUET_EXPORT std::string formatStatValue(
     Type::type parquetType,
-    ::std::string_view val);
+    ::std::string_view val,
+    const std::shared_ptr<const LogicalType>& logicalType = nullptr);
 
 PARQUET_EXPORT int getTypeByteSize(Type::type t);
 

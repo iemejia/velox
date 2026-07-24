@@ -23,6 +23,7 @@
 #include <string>
 
 #include "arrow/util/checked_cast.h"
+#include "arrow/util/float16.h"
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/dwio/parquet/writer/arrow/Exception.h"
@@ -95,7 +96,18 @@ bool pageCanUseChecksum(PageType::type pageType) {
   }
 }
 
-std::string formatStatValue(Type::type parquetType, ::std::string_view val) {
+std::string formatFloat16Value(::std::string_view val) {
+  std::stringstream result;
+  auto float16 = ::arrow::util::Float16::FromLittleEndian(
+      reinterpret_cast<const uint8_t*>(val.data()));
+  result << float16.ToFloat();
+  return result.str();
+}
+
+std::string formatStatValue(
+    Type::type parquetType,
+    ::std::string_view val,
+    const std::shared_ptr<const LogicalType>& logicalType) {
   std::stringstream result;
 
   const char* bytes = val.data();
@@ -124,6 +136,9 @@ std::string formatStatValue(Type::type parquetType, ::std::string_view val) {
       return std::string(val);
     }
     case Type::kFixedLenByteArray: {
+      if (logicalType != nullptr && logicalType->isFloat16()) {
+        return formatFloat16Value(val);
+      }
       return std::string(val);
     }
     case Type::kUndefined:
@@ -356,15 +371,26 @@ std::shared_ptr<const LogicalType> LogicalType::fromConvertedType(
     case ConvertedType::kDate:
       return DateLogicalType::make();
     case ConvertedType::kTimeMillis:
-      return TimeLogicalType::make(true, LogicalType::TimeUnit::kMillis);
+      // ConvertedType::TIME_* are deprecated in favor of LogicalType::Time.
+      return TimeLogicalType::make(
+          /*isAdjustedToUtc=*/true, LogicalType::TimeUnit::kMillis);
     case ConvertedType::kTimeMicros:
-      return TimeLogicalType::make(true, LogicalType::TimeUnit::kMicros);
+      return TimeLogicalType::make(
+          /*isAdjustedToUtc=*/true, LogicalType::TimeUnit::kMicros);
     case ConvertedType::kTimestampMillis:
+      // ConvertedType::TIMESTAMP_* are deprecated in favor of
+      // LogicalType::Timestamp.
       return TimestampLogicalType::make(
-          true, LogicalType::TimeUnit::kMillis, true, false);
+          /*isAdjustedToUtc=*/true,
+          LogicalType::TimeUnit::kMillis,
+          /*isFromConvertedType=*/true,
+          /*forceSetConvertedType=*/false);
     case ConvertedType::kTimestampMicros:
       return TimestampLogicalType::make(
-          true, LogicalType::TimeUnit::kMicros, true, false);
+          /*isAdjustedToUtc=*/true,
+          LogicalType::TimeUnit::kMicros,
+          /*isFromConvertedType=*/true,
+          /*forceSetConvertedType=*/false);
     case ConvertedType::kInterval:
       return IntervalLogicalType::make();
     case ConvertedType::kInt8:
@@ -1915,7 +1941,8 @@ LogicalType::Impl::Variant::toThrift() const {
   return type;
 }
 
-std::shared_ptr<const LogicalType> VariantLogicalType::make(int8_t specVersion) {
+std::shared_ptr<const LogicalType> VariantLogicalType::make(
+    int8_t specVersion) {
   auto* logicalType = new VariantLogicalType();
   logicalType->impl_.reset(new LogicalType::Impl::Variant(specVersion));
   return std::shared_ptr<const LogicalType>(logicalType);
@@ -2099,7 +2126,8 @@ const std::string& GeographyLogicalType::crs() const {
   return dynamic_cast<const LogicalType::Impl::Geography&>(*impl_).crs();
 }
 
-LogicalType::EdgeInterpolationAlgorithm GeographyLogicalType::algorithm() const {
+LogicalType::EdgeInterpolationAlgorithm GeographyLogicalType::algorithm()
+    const {
   return dynamic_cast<const LogicalType::Impl::Geography&>(*impl_).algorithm();
 }
 
