@@ -397,6 +397,48 @@ std::shared_ptr<const LogicalType> LogicalType::fromConvertedType(
   return UndefinedLogicalType::make();
 }
 
+namespace {
+LogicalType::EdgeInterpolationAlgorithm fromThriftAlgorithm(
+    facebook::velox::parquet::thrift::EdgeInterpolationAlgorithm algorithm) {
+  using ThriftAlgorithm =
+      facebook::velox::parquet::thrift::EdgeInterpolationAlgorithm;
+  switch (algorithm) {
+    case ThriftAlgorithm::SPHERICAL:
+      return LogicalType::EdgeInterpolationAlgorithm::kSpherical;
+    case ThriftAlgorithm::VINCENTY:
+      return LogicalType::EdgeInterpolationAlgorithm::kVincenty;
+    case ThriftAlgorithm::THOMAS:
+      return LogicalType::EdgeInterpolationAlgorithm::kThomas;
+    case ThriftAlgorithm::ANDOYER:
+      return LogicalType::EdgeInterpolationAlgorithm::kAndoyer;
+    case ThriftAlgorithm::KARNEY:
+      return LogicalType::EdgeInterpolationAlgorithm::kKarney;
+    default:
+      return LogicalType::EdgeInterpolationAlgorithm::kSpherical;
+  }
+}
+
+facebook::velox::parquet::thrift::EdgeInterpolationAlgorithm toThriftAlgorithm(
+    LogicalType::EdgeInterpolationAlgorithm algorithm) {
+  using ThriftAlgorithm =
+      facebook::velox::parquet::thrift::EdgeInterpolationAlgorithm;
+  switch (algorithm) {
+    case LogicalType::EdgeInterpolationAlgorithm::kSpherical:
+      return ThriftAlgorithm::SPHERICAL;
+    case LogicalType::EdgeInterpolationAlgorithm::kVincenty:
+      return ThriftAlgorithm::VINCENTY;
+    case LogicalType::EdgeInterpolationAlgorithm::kThomas:
+      return ThriftAlgorithm::THOMAS;
+    case LogicalType::EdgeInterpolationAlgorithm::kAndoyer:
+      return ThriftAlgorithm::ANDOYER;
+    case LogicalType::EdgeInterpolationAlgorithm::kKarney:
+      return ThriftAlgorithm::KARNEY;
+    default:
+      return ThriftAlgorithm::SPHERICAL;
+  }
+}
+} // namespace
+
 std::shared_ptr<const LogicalType> LogicalType::fromThrift(
     const facebook::velox::parquet::thrift::LogicalType& type) {
   using Type = facebook::velox::parquet::thrift::LogicalType::Type;
@@ -462,6 +504,31 @@ std::shared_ptr<const LogicalType> LogicalType::fromThrift(
       return UuidLogicalType::make();
     case Type::FLOAT16:
       return Float16LogicalType::make();
+    case Type::GEOMETRY: {
+      std::string crs;
+      if (type.get_GEOMETRY().crs().has_value()) {
+        crs = *type.get_GEOMETRY().crs();
+      }
+      return GeometryLogicalType::make(std::move(crs));
+    }
+    case Type::GEOGRAPHY: {
+      std::string crs;
+      if (type.get_GEOGRAPHY().crs().has_value()) {
+        crs = *type.get_GEOGRAPHY().crs();
+      }
+      auto algorithm = LogicalType::EdgeInterpolationAlgorithm::kSpherical;
+      if (type.get_GEOGRAPHY().algorithm().has_value()) {
+        algorithm = fromThriftAlgorithm(*type.get_GEOGRAPHY().algorithm());
+      }
+      return GeographyLogicalType::make(std::move(crs), algorithm);
+    }
+    case Type::VARIANT: {
+      int8_t specVersion = LogicalType::kVariantSpecVersion;
+      if (type.get_VARIANT().specification_version().has_value()) {
+        specVersion = *type.get_VARIANT().specification_version();
+      }
+      return VariantLogicalType::make(specVersion);
+    }
     default:
       throw ParquetException(
           "Metadata contains Thrift LogicalType that is not recognized");
@@ -545,6 +612,20 @@ std::shared_ptr<const LogicalType> LogicalType::uuid() {
 
 std::shared_ptr<const LogicalType> LogicalType::float16() {
   return Float16LogicalType::make();
+}
+
+std::shared_ptr<const LogicalType> LogicalType::variant(int8_t specVersion) {
+  return VariantLogicalType::make(specVersion);
+}
+
+std::shared_ptr<const LogicalType> LogicalType::geometry(std::string crs) {
+  return GeometryLogicalType::make(std::move(crs));
+}
+
+std::shared_ptr<const LogicalType> LogicalType::geography(
+    std::string crs,
+    LogicalType::EdgeInterpolationAlgorithm algorithm) {
+  return GeographyLogicalType::make(std::move(crs), algorithm);
 }
 
 std::shared_ptr<const LogicalType> LogicalType::none() {
@@ -642,6 +723,9 @@ class LogicalType::Impl {
   class Bson;
   class Uuid;
   class Float16;
+  class Variant;
+  class Geometry;
+  class Geography;
   class No;
   class Undefined;
 
@@ -749,6 +833,18 @@ bool LogicalType::isUuid() const {
 
 bool LogicalType::isFloat16() const {
   return impl_->type() == LogicalType::Type::kFloat16;
+}
+
+bool LogicalType::isVariant() const {
+  return impl_->type() == LogicalType::Type::kVariant;
+}
+
+bool LogicalType::isGeometry() const {
+  return impl_->type() == LogicalType::Type::kGeometry;
+}
+
+bool LogicalType::isGeography() const {
+  return impl_->type() == LogicalType::Type::kGeography;
 }
 bool LogicalType::isNone() const {
   return impl_->type() == LogicalType::Type::kNone;
@@ -1773,6 +1869,244 @@ class LogicalType::Impl::Float16 final
 };
 
 GENERATE_MAKE(Float16)
+
+class LogicalType::Impl::Variant final
+    : public LogicalType::Impl::Incompatible,
+      public LogicalType::Impl::Inapplicable {
+ public:
+  friend class VariantLogicalType;
+
+  std::string toString() const override;
+  std::string toJson() const override;
+  facebook::velox::parquet::thrift::LogicalType toThrift() const override;
+
+  int8_t specVersion() const {
+    return specVersion_;
+  }
+
+ private:
+  explicit Variant(int8_t specVersion)
+      : LogicalType::Impl(LogicalType::Type::kVariant, SortOrder::kUnknown),
+        LogicalType::Impl::Inapplicable(),
+        specVersion_(specVersion) {}
+
+  int8_t specVersion_;
+};
+
+std::string LogicalType::Impl::Variant::toString() const {
+  std::stringstream type;
+  type << "Variant(" << static_cast<int>(specVersion_) << ")";
+  return type.str();
+}
+
+std::string LogicalType::Impl::Variant::toJson() const {
+  std::stringstream json;
+  json << R"({"Type": "Variant", "SpecVersion": )"
+       << static_cast<int>(specVersion_) << "}";
+  return json.str();
+}
+
+facebook::velox::parquet::thrift::LogicalType
+LogicalType::Impl::Variant::toThrift() const {
+  facebook::velox::parquet::thrift::LogicalType type;
+  facebook::velox::parquet::thrift::VariantType variantType;
+  variantType.specification_version() = specVersion_;
+  type.set_VARIANT(variantType);
+  return type;
+}
+
+std::shared_ptr<const LogicalType> VariantLogicalType::make(int8_t specVersion) {
+  auto* logicalType = new VariantLogicalType();
+  logicalType->impl_.reset(new LogicalType::Impl::Variant(specVersion));
+  return std::shared_ptr<const LogicalType>(logicalType);
+}
+
+int8_t VariantLogicalType::specVersion() const {
+  return dynamic_cast<const LogicalType::Impl::Variant&>(*impl_).specVersion();
+}
+
+class LogicalType::Impl::Geometry final
+    : public LogicalType::Impl::Incompatible,
+      public LogicalType::Impl::SimpleApplicable {
+ public:
+  friend class GeometryLogicalType;
+
+  std::string toString() const override;
+  std::string toJson() const override;
+  facebook::velox::parquet::thrift::LogicalType toThrift() const override;
+  bool equals(const LogicalType& other) const override;
+
+  const std::string& crs() const {
+    return crs_;
+  }
+
+ private:
+  explicit Geometry(std::string crs)
+      : LogicalType::Impl(LogicalType::Type::kGeometry, SortOrder::kUnknown),
+        LogicalType::Impl::SimpleApplicable(parquet::Type::kByteArray),
+        crs_(std::move(crs)) {}
+
+  std::string crs_;
+};
+
+std::string LogicalType::Impl::Geometry::toString() const {
+  std::stringstream type;
+  type << "Geometry(crs=" << crs_ << ")";
+  return type.str();
+}
+
+std::string LogicalType::Impl::Geometry::toJson() const {
+  std::stringstream json;
+  json << R"({"Type": "Geometry")";
+  if (!crs_.empty()) {
+    json << R"(, "crs": ")" << crs_ << R"(")";
+  }
+  json << "}";
+  return json.str();
+}
+
+facebook::velox::parquet::thrift::LogicalType
+LogicalType::Impl::Geometry::toThrift() const {
+  facebook::velox::parquet::thrift::LogicalType type;
+  facebook::velox::parquet::thrift::GeometryType geometryType;
+  // Canonically export an empty crs as unset.
+  if (!crs_.empty()) {
+    geometryType.crs() = crs_;
+  }
+  type.set_GEOMETRY(geometryType);
+  return type;
+}
+
+bool LogicalType::Impl::Geometry::equals(const LogicalType& other) const {
+  if (other.isGeometry()) {
+    const auto& otherGeometry = checked_cast<const GeometryLogicalType&>(other);
+    return crs() == otherGeometry.crs();
+  }
+  return false;
+}
+
+std::shared_ptr<const LogicalType> GeometryLogicalType::make(std::string crs) {
+  auto* logicalType = new GeometryLogicalType();
+  logicalType->impl_.reset(new LogicalType::Impl::Geometry(std::move(crs)));
+  return std::shared_ptr<const LogicalType>(logicalType);
+}
+
+const std::string& GeometryLogicalType::crs() const {
+  return dynamic_cast<const LogicalType::Impl::Geometry&>(*impl_).crs();
+}
+
+class LogicalType::Impl::Geography final
+    : public LogicalType::Impl::Incompatible,
+      public LogicalType::Impl::SimpleApplicable {
+ public:
+  friend class GeographyLogicalType;
+
+  std::string toString() const override;
+  std::string toJson() const override;
+  facebook::velox::parquet::thrift::LogicalType toThrift() const override;
+  bool equals(const LogicalType& other) const override;
+
+  const std::string& crs() const {
+    return crs_;
+  }
+
+  LogicalType::EdgeInterpolationAlgorithm algorithm() const {
+    return algorithm_;
+  }
+
+  std::string_view algorithmName() const {
+    switch (algorithm_) {
+      case LogicalType::EdgeInterpolationAlgorithm::kSpherical:
+        return "spherical";
+      case LogicalType::EdgeInterpolationAlgorithm::kVincenty:
+        return "vincenty";
+      case LogicalType::EdgeInterpolationAlgorithm::kThomas:
+        return "thomas";
+      case LogicalType::EdgeInterpolationAlgorithm::kAndoyer:
+        return "andoyer";
+      case LogicalType::EdgeInterpolationAlgorithm::kKarney:
+        return "karney";
+      default:
+        return "unknown";
+    }
+  }
+
+ private:
+  Geography(std::string crs, LogicalType::EdgeInterpolationAlgorithm algorithm)
+      : LogicalType::Impl(LogicalType::Type::kGeography, SortOrder::kUnknown),
+        LogicalType::Impl::SimpleApplicable(parquet::Type::kByteArray),
+        crs_(std::move(crs)),
+        algorithm_(algorithm) {}
+
+  std::string crs_;
+  LogicalType::EdgeInterpolationAlgorithm algorithm_;
+};
+
+std::string LogicalType::Impl::Geography::toString() const {
+  std::stringstream type;
+  type << "Geography(crs=" << crs_ << ", algorithm=" << algorithmName() << ")";
+  return type.str();
+}
+
+std::string LogicalType::Impl::Geography::toJson() const {
+  std::stringstream json;
+  json << R"({"Type": "Geography")";
+  if (!crs_.empty()) {
+    json << R"(, "crs": ")" << crs_ << R"(")";
+  }
+  if (algorithm_ != LogicalType::EdgeInterpolationAlgorithm::kSpherical) {
+    json << R"(, "algorithm": ")" << algorithmName() << R"(")";
+  }
+  json << "}";
+  return json.str();
+}
+
+facebook::velox::parquet::thrift::LogicalType
+LogicalType::Impl::Geography::toThrift() const {
+  facebook::velox::parquet::thrift::LogicalType type;
+  facebook::velox::parquet::thrift::GeographyType geographyType;
+  if (!crs_.empty()) {
+    geographyType.crs() = crs_;
+  }
+  // Canonically export the spherical algorithm as unset.
+  if (algorithm_ != LogicalType::EdgeInterpolationAlgorithm::kSpherical) {
+    geographyType.algorithm() = toThriftAlgorithm(algorithm_);
+  }
+  type.set_GEOGRAPHY(geographyType);
+  return type;
+}
+
+bool LogicalType::Impl::Geography::equals(const LogicalType& other) const {
+  if (other.isGeography()) {
+    const auto& otherGeography =
+        checked_cast<const GeographyLogicalType&>(other);
+    return crs() == otherGeography.crs() &&
+        algorithm() == otherGeography.algorithm();
+  }
+  return false;
+}
+
+std::shared_ptr<const LogicalType> GeographyLogicalType::make(
+    std::string crs,
+    LogicalType::EdgeInterpolationAlgorithm algorithm) {
+  auto* logicalType = new GeographyLogicalType();
+  logicalType->impl_.reset(
+      new LogicalType::Impl::Geography(std::move(crs), algorithm));
+  return std::shared_ptr<const LogicalType>(logicalType);
+}
+
+const std::string& GeographyLogicalType::crs() const {
+  return dynamic_cast<const LogicalType::Impl::Geography&>(*impl_).crs();
+}
+
+LogicalType::EdgeInterpolationAlgorithm GeographyLogicalType::algorithm() const {
+  return dynamic_cast<const LogicalType::Impl::Geography&>(*impl_).algorithm();
+}
+
+std::string_view GeographyLogicalType::algorithmName() const {
+  return dynamic_cast<const LogicalType::Impl::Geography&>(*impl_)
+      .algorithmName();
+}
 
 class LogicalType::Impl::No final
     : public LogicalType::Impl::SimpleCompatible,

@@ -182,6 +182,15 @@ class PARQUET_EXPORT LogicalType {
     enum Unit { kUnknown = 0, kMillis = 1, kMicros, kNanos };
   };
 
+  /// \brief Edge interpolation algorithm for the Geography logical type.
+  enum class EdgeInterpolationAlgorithm {
+    kSpherical = 0,
+    kVincenty,
+    kThomas,
+    kAndoyer,
+    kKarney,
+  };
+
   /// \brief If possible, return a logical type equivalent to the given legacy
   /// converted type (and decimal metadata if applicable).
   static std::shared_ptr<const LogicalType> fromConvertedType(
@@ -238,6 +247,22 @@ class PARQUET_EXPORT LogicalType {
   /// \brief Create a Float16 logical type (physical FIXED_LEN_BYTE_ARRAY(2)).
   static std::shared_ptr<const LogicalType> float16();
 
+  /// \brief Default Variant specification version.
+  static constexpr int8_t kVariantSpecVersion = 1;
+
+  /// \brief Create a Variant logical type.
+  static std::shared_ptr<const LogicalType> variant(
+      int8_t specVersion = kVariantSpecVersion);
+
+  /// \brief Create a Geometry logical type (physical BYTE_ARRAY, WKB).
+  static std::shared_ptr<const LogicalType> geometry(std::string crs = "");
+
+  /// \brief Create a Geography logical type (physical BYTE_ARRAY, WKB).
+  static std::shared_ptr<const LogicalType> geography(
+      std::string crs = "",
+      LogicalType::EdgeInterpolationAlgorithm algorithm =
+          LogicalType::EdgeInterpolationAlgorithm::kSpherical);
+
   /// \brief Create a placeholder for when no logical type is specified.
   static std::shared_ptr<const LogicalType> none();
 
@@ -293,6 +318,9 @@ class PARQUET_EXPORT LogicalType {
   bool isBson() const;
   bool isUuid() const;
   bool isFloat16() const;
+  bool isVariant() const;
+  bool isGeometry() const;
+  bool isGeography() const;
   bool isNone() const;
   /// \brief Return true if this logical type is of a known type.
   bool isValid() const;
@@ -476,6 +504,45 @@ class PARQUET_EXPORT Float16LogicalType : public LogicalType {
 
  private:
   Float16LogicalType() = default;
+};
+
+/// \brief Allowed for a group node with value and optional metadata columns.
+class PARQUET_EXPORT VariantLogicalType : public LogicalType {
+ public:
+  static std::shared_ptr<const LogicalType> make(
+      int8_t specVersion = kVariantSpecVersion);
+
+  int8_t specVersion() const;
+
+ private:
+  VariantLogicalType() = default;
+};
+
+/// \brief Allowed for physical type BYTE_ARRAY, must be encoded as WKB.
+class PARQUET_EXPORT GeometryLogicalType : public LogicalType {
+ public:
+  static std::shared_ptr<const LogicalType> make(std::string crs = "");
+
+  const std::string& crs() const;
+
+ private:
+  GeometryLogicalType() = default;
+};
+
+/// \brief Allowed for physical type BYTE_ARRAY, must be encoded as WKB.
+class PARQUET_EXPORT GeographyLogicalType : public LogicalType {
+ public:
+  static std::shared_ptr<const LogicalType> make(
+      std::string crs = "",
+      LogicalType::EdgeInterpolationAlgorithm algorithm =
+          LogicalType::EdgeInterpolationAlgorithm::kSpherical);
+
+  const std::string& crs() const;
+  LogicalType::EdgeInterpolationAlgorithm algorithm() const;
+  std::string_view algorithmName() const;
+
+ private:
+  GeographyLogicalType() = default;
 };
 
 /// \brief Allowed for any physical type.
