@@ -42,6 +42,7 @@
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/dwio/parquet/common/LevelConversion.h"
+#include "velox/dwio/parquet/writer/arrow/ChunkerInternal.h"
 #include "velox/dwio/parquet/writer/arrow/ColumnPage.h"
 #include "velox/dwio/parquet/writer/arrow/Encoding.h"
 #include "velox/dwio/parquet/writer/arrow/Encryption.h"
@@ -957,7 +958,16 @@ class ColumnWriterImpl {
     }
     if (descr_->logicalType() != nullptr &&
         descr_->logicalType()->isGeometry()) {
-      chunkGeospatialStatistics_ = std::make_shared<geospatial::GeoStatistics>();
+      chunkGeospatialStatistics_ =
+          std::make_shared<geospatial::GeoStatistics>();
+    }
+    if (properties_->contentDefinedChunkingEnabled()) {
+      auto cdcOptions = properties_->contentDefinedChunkingOptions();
+      contentDefinedChunker_.emplace(
+          levelInfo_,
+          cdcOptions.minChunkSize,
+          cdcOptions.maxChunkSize,
+          cdcOptions.normLevel);
     }
     if (properties_->sizeStatisticsLevel() ==
         SizeStatisticsLevel::kPageAndColumnChunk) {
@@ -1126,6 +1136,7 @@ class ColumnWriterImpl {
   // statistics collection is disabled.
   std::unique_ptr<SizeStatistics> chunkSizeStatistics_;
   std::shared_ptr<geospatial::GeoStatistics> chunkGeospatialStatistics_;
+  std::optional<internal::ContentDefinedChunker> contentDefinedChunker_;
 
   // Accumulated size statistics for the current data page, or null unless
   // page-level statistics are enabled. Reset after each page is built.
@@ -1599,6 +1610,11 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
       const int16_t* defLevels,
       const int16_t* repLevels,
       const T* values) override {
+    if (ARROW_PREDICT_FALSE(properties_->contentDefinedChunkingEnabled())) {
+      throw ParquetException(
+          "Content-defined chunking is not supported in writeBatch() or "
+          "writeBatchSpaced(), use writeArrow() instead.");
+    }
     // We check for DataPage limits only after we have inserted the values. If
     // a user writes a large number of values, the DataPage size can be much
     // above the limit. The purpose of this chunking is to bound this. Even if
@@ -1643,6 +1659,11 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
       const uint8_t* validBits,
       int64_t validBitsOffset,
       const T* values) override {
+    if (ARROW_PREDICT_FALSE(properties_->contentDefinedChunkingEnabled())) {
+      throw ParquetException(
+          "Content-defined chunking is not supported in writeBatch() or "
+          "writeBatchSpaced(), use writeArrow() instead.");
+    }
     // Like WriteBatch, but for spaced values.
     int64_t valueOffset = 0;
     auto writeChunk = [&](int64_t offset, int64_t batchSize, bool checkPage) {
@@ -1724,6 +1745,44 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
               ::arrow::bit_util::BytesForBits(properties_->writeBatchSize()),
               ctx->memoryPool));
       bitsBuffer_->ZeroPadding();
+    }
+
+    if (contentDefinedChunker_.has_value()) {
+      // Split the input at content-defined chunk boundaries and flush a data
+      // page at each boundary, so identical data yields identical byte
+      // sequences across files (content-addressable dedup). The last chunk does
+      // not force a new page, letting a subsequent writeArrow() continue the
+      // current page; the chunker's rolling state is not reset between calls.
+      auto chunks = contentDefinedChunker_->GetChunks(
+          defLevels, repLevels, numLevels, leafArray);
+      for (size_t i = 0; i < chunks.size(); i++) {
+        const auto& chunk = chunks[i];
+        auto chunkArray = leafArray.Slice(chunk.value_offset);
+        auto chunkDefLevels = addIfNotNull(defLevels, chunk.level_offset);
+        auto chunkRepLevels = addIfNotNull(repLevels, chunk.level_offset);
+        if (leafArray.type()->id() == ::arrow::Type::DICTIONARY) {
+          ARROW_RETURN_NOT_OK(writeArrowDictionary(
+              chunkDefLevels,
+              chunkRepLevels,
+              chunk.levels_to_write,
+              *chunkArray,
+              ctx,
+              maybeParentNulls));
+        } else {
+          ARROW_RETURN_NOT_OK(writeArrowDense(
+              chunkDefLevels,
+              chunkRepLevels,
+              chunk.levels_to_write,
+              *chunkArray,
+              ctx,
+              maybeParentNulls));
+        }
+        const bool isLastChunk = i == (chunks.size() - 1);
+        if (numBufferedValues_ > 0 && !isLastChunk) {
+          addDataPage();
+        }
+      }
+      return ::arrow::Status::OK();
     }
 
     if (leafArray.type()->id() == ::arrow::Type::DICTIONARY) {
