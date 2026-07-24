@@ -273,8 +273,32 @@ struct SizeStatistics {
     * field may be omitted if max_definition_level is 0 or 1 without loss of
     * information.
     */
-   3: optional list<i64> definition_level_histogram;
+    3: optional list<i64> definition_level_histogram;
 }
+
+/**
+ * Bounding box for GEOMETRY or GEOGRAPHY type, as min/max coordinate pairs on
+ * each axis.
+ */
+struct BoundingBox {
+  1: required double xmin;
+  2: required double xmax;
+  3: required double ymin;
+  4: required double ymax;
+  5: optional double zmin;
+  6: optional double zmax;
+  7: optional double mmin;
+  8: optional double mmax;
+}
+
+/** Statistics specific to Geometry and Geography logical types. */
+struct GeospatialStatistics {
+  // A bounding box of geospatial instances.
+  1: optional BoundingBox bbox;
+  // Geospatial type codes of all instances, or an empty list if not known.
+  2: optional list<i32> geospatial_types;
+}
+
 
 /** Empty structs to use as logical type annotations */
 struct StringType {} // allowed for BINARY, must be encoded with UTF-8
@@ -857,6 +881,7 @@ struct ColumnMetaData {
    * filter pushdown.
    */
   16: optional SizeStatistics size_statistics;
+  17: optional GeospatialStatistics geospatial_statistics;
 }
 
 struct EncryptionWithFooterKey {}
