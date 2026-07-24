@@ -1846,6 +1846,12 @@ class ColumnChunkMetaDataBuilder::ColumnChunkMetaDataBuilderImpl {
         std::move(thriftSizeStatistics);
   }
 
+  void setGeospatialStatistics(
+      const geospatial::EncodedGeoStatistics& geoStatistics) {
+    apache::thrift::can_throw(columnChunk_->meta_data())
+        ->geospatial_statistics() = ToThrift(geoStatistics);
+  }
+
   // column chunk
   void set_file_path(const std::string& val) {
     columnChunk_->file_path() = val;
@@ -2121,6 +2127,11 @@ void ColumnChunkMetaDataBuilder::setStatistics(
 void ColumnChunkMetaDataBuilder::setSizeStatistics(
     const SizeStatistics& sizeStatistics) {
   impl_->setSizeStatistics(sizeStatistics);
+}
+
+void ColumnChunkMetaDataBuilder::setGeospatialStatistics(
+    const geospatial::EncodedGeoStatistics& geoStatistics) {
+  impl_->setGeospatialStatistics(geoStatistics);
 }
 
 int64_t ColumnChunkMetaDataBuilder::totalCompressedSize() const {

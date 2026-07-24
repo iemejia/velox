@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include "velox/dwio/parquet/writer/arrow/GeospatialStatistics.h"
 #include "velox/dwio/parquet/writer/arrow/Platform.h"
 #include "velox/dwio/parquet/writer/arrow/Properties.h"
 #include "velox/dwio/parquet/writer/arrow/Schema.h"
@@ -496,6 +497,10 @@ class PARQUET_EXPORT ColumnChunkMetaDataBuilder {
 
   /// Sets the size statistics for this column chunk.
   void setSizeStatistics(const SizeStatistics& sizeStatistics);
+
+  /// Sets the geospatial (bounding box) statistics for this column chunk.
+  void setGeospatialStatistics(
+      const geospatial::EncodedGeoStatistics& geoStatistics);
   // Get the column descriptor.
   const ColumnDescriptor* descr() const;
 

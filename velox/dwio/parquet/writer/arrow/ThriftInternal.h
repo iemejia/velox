@@ -34,6 +34,7 @@
 #include "velox/dwio/parquet/writer/arrow/Exception.h"
 #include "velox/dwio/parquet/writer/arrow/FileDecryptorInternal.h"
 #include "velox/dwio/parquet/writer/arrow/FileEncryptorInternal.h"
+#include "velox/dwio/parquet/writer/arrow/GeospatialStatistics.h"
 #include "velox/dwio/parquet/writer/arrow/Platform.h"
 #include "velox/dwio/parquet/writer/arrow/Statistics.h"
 
@@ -265,6 +266,56 @@ static inline SortingColumn FromThrift(
   sorting_column.nullsFirst = *thrift_sorting_column.nulls_first();
   sorting_column.descending = *thrift_sorting_column.descending();
   return sorting_column;
+}
+
+static inline geospatial::EncodedGeoStatistics FromThrift(
+    const facebook::velox::parquet::thrift::GeospatialStatistics& geoStats) {
+  geospatial::EncodedGeoStatistics out;
+  if (geoStats.geospatial_types().has_value()) {
+    out.geospatial_types = *geoStats.geospatial_types();
+  }
+  if (geoStats.bbox().has_value()) {
+    const auto& bbox = *geoStats.bbox();
+    out.xmin = *bbox.xmin();
+    out.xmax = *bbox.xmax();
+    out.ymin = *bbox.ymin();
+    out.ymax = *bbox.ymax();
+    out.xy_bounds_present = true;
+    if (bbox.zmin().has_value() && bbox.zmax().has_value()) {
+      out.zmin = *bbox.zmin();
+      out.zmax = *bbox.zmax();
+      out.z_bounds_present = true;
+    }
+    if (bbox.mmin().has_value() && bbox.mmax().has_value()) {
+      out.mmin = *bbox.mmin();
+      out.mmax = *bbox.mmax();
+      out.m_bounds_present = true;
+    }
+  }
+  return out;
+}
+
+static inline facebook::velox::parquet::thrift::GeospatialStatistics ToThrift(
+    const geospatial::EncodedGeoStatistics& encodedGeoStats) {
+  facebook::velox::parquet::thrift::GeospatialStatistics geospatialStatistics;
+  geospatialStatistics.geospatial_types() = encodedGeoStats.geospatial_types;
+  if (encodedGeoStats.xy_bounds_present) {
+    facebook::velox::parquet::thrift::BoundingBox bbox;
+    bbox.xmin() = encodedGeoStats.xmin;
+    bbox.xmax() = encodedGeoStats.xmax;
+    bbox.ymin() = encodedGeoStats.ymin;
+    bbox.ymax() = encodedGeoStats.ymax;
+    if (encodedGeoStats.z_bounds_present) {
+      bbox.zmin() = encodedGeoStats.zmin;
+      bbox.zmax() = encodedGeoStats.zmax;
+    }
+    if (encodedGeoStats.m_bounds_present) {
+      bbox.mmin() = encodedGeoStats.mmin;
+      bbox.mmax() = encodedGeoStats.mmax;
+    }
+    geospatialStatistics.bbox() = std::move(bbox);
+  }
+  return geospatialStatistics;
 }
 
 // ----------------------------------------------------------------------.
