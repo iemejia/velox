@@ -170,6 +170,10 @@ class PARQUET_EXPORT LogicalType {
       kJson,
       kBson,
       kUuid,
+      kFloat16,
+      kVariant,
+      kGeometry,
+      kGeography,
       kNone // Not a real logical type; should always be last element
     };
   };
@@ -231,6 +235,9 @@ class PARQUET_EXPORT LogicalType {
   static std::shared_ptr<const LogicalType> bson();
   static std::shared_ptr<const LogicalType> uuid();
 
+  /// \brief Create a Float16 logical type (physical FIXED_LEN_BYTE_ARRAY(2)).
+  static std::shared_ptr<const LogicalType> float16();
+
   /// \brief Create a placeholder for when no logical type is specified.
   static std::shared_ptr<const LogicalType> none();
 
@@ -285,6 +292,7 @@ class PARQUET_EXPORT LogicalType {
   bool isJson() const;
   bool isBson() const;
   bool isUuid() const;
+  bool isFloat16() const;
   bool isNone() const;
   /// \brief Return true if this logical type is of a known type.
   bool isValid() const;
@@ -459,6 +467,15 @@ class PARQUET_EXPORT UuidLogicalType : public LogicalType {
 
  private:
   UuidLogicalType() = default;
+};
+
+/// \brief Allowed for physical type FIXED_LEN_BYTE_ARRAY with length 2.
+class PARQUET_EXPORT Float16LogicalType : public LogicalType {
+ public:
+  static std::shared_ptr<const LogicalType> make();
+
+ private:
+  Float16LogicalType() = default;
 };
 
 /// \brief Allowed for any physical type.

@@ -460,6 +460,8 @@ std::shared_ptr<const LogicalType> LogicalType::fromThrift(
       return BsonLogicalType::make();
     case Type::UUID:
       return UuidLogicalType::make();
+    case Type::FLOAT16:
+      return Float16LogicalType::make();
     default:
       throw ParquetException(
           "Metadata contains Thrift LogicalType that is not recognized");
@@ -539,6 +541,10 @@ std::shared_ptr<const LogicalType> LogicalType::bson() {
 
 std::shared_ptr<const LogicalType> LogicalType::uuid() {
   return UuidLogicalType::make();
+}
+
+std::shared_ptr<const LogicalType> LogicalType::float16() {
+  return Float16LogicalType::make();
 }
 
 std::shared_ptr<const LogicalType> LogicalType::none() {
@@ -635,6 +641,7 @@ class LogicalType::Impl {
   class Json;
   class Bson;
   class Uuid;
+  class Float16;
   class No;
   class Undefined;
 
@@ -738,6 +745,10 @@ bool LogicalType::isBson() const {
 }
 bool LogicalType::isUuid() const {
   return impl_->type() == LogicalType::Type::kUuid;
+}
+
+bool LogicalType::isFloat16() const {
+  return impl_->type() == LogicalType::Type::kFloat16;
 }
 bool LogicalType::isNone() const {
   return impl_->type() == LogicalType::Type::kNone;
@@ -1743,6 +1754,25 @@ class LogicalType::Impl::Uuid final
 };
 
 GENERATE_MAKE(Uuid)
+
+class LogicalType::Impl::Float16 final
+    : public LogicalType::Impl::Incompatible,
+      public LogicalType::Impl::TypeLengthApplicable {
+ public:
+  friend class Float16LogicalType;
+
+  OVERRIDE_TOSTRING(Float16)
+  OVERRIDE_TOTHRIFT(Float16Type, FLOAT16)
+
+ private:
+  Float16()
+      : LogicalType::Impl(LogicalType::Type::kFloat16, SortOrder::kSigned),
+        LogicalType::Impl::TypeLengthApplicable(
+            parquet::Type::kFixedLenByteArray,
+            2) {}
+};
+
+GENERATE_MAKE(Float16)
 
 class LogicalType::Impl::No final
     : public LogicalType::Impl::SimpleCompatible,
