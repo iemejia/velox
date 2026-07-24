@@ -674,6 +674,15 @@ velox_resolve_dependency(simdjson 4.1.0)
 velox_set_source(FastFloat)
 velox_resolve_dependency(FastFloat)
 
+# Header-only, used by the vendored Parquet writer's geospatial statistics.
+# Consumed via include dir (not a target link) so the exported mono velox
+# library's install/export set stays clean. Forced BUNDLED because
+# RapidJSON's installed CMake config breaks under modern CMake.
+set(RapidJSON_SOURCE BUNDLED)
+velox_set_source(RapidJSON)
+velox_resolve_dependency(RapidJSON)
+include_directories(SYSTEM ${RAPIDJSON_INCLUDE_DIR})
+
 velox_set_source(folly)
 velox_resolve_dependency(folly)
 

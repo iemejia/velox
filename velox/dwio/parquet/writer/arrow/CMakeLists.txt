@@ -30,6 +30,9 @@ velox_add_library(
   FileEncryptorInternal.cpp
   FileDecryptorInternal.cpp
   FileWriter.cpp
+  GeospatialStatistics.cpp
+  GeospatialUtilInternal.cpp
+  GeospatialUtilJsonInternal.cpp
   Metadata.cpp
   PageIndex.cpp
   PathInternal.cpp
@@ -53,6 +56,9 @@ velox_add_library(
   FileDecryptorInternal.h
   FileEncryptorInternal.h
   FileWriter.h
+  GeospatialStatistics.h
+  GeospatialUtilInternal.h
+  GeospatialUtilJsonInternal.h
   Metadata.h
   PageIndex.h
   PathInternal.h
@@ -76,4 +82,12 @@ velox_link_libraries(
   velox_arrow_bridge
   arrow
   fmt::fmt
+)
+
+# The vendored Arrow-derived writer sources are not C++20 modules. Scanning them
+# for module deps mis-imports Types.h inside the writer namespace; disable it.
+set_source_files_properties(
+  GeospatialStatistics.cpp GeospatialUtilInternal.cpp
+  GeospatialUtilJsonInternal.cpp
+  PROPERTIES CXX_SCAN_FOR_MODULES OFF
 )
