@@ -362,6 +362,52 @@ struct JsonType {}
  */
 struct BsonType {}
 
+// Allowed for physical type FIXED[2], stored as raw FLOAT16 bytes.
+struct Float16Type {}
+
+/**
+ * Embedded Variant logical type annotation.
+ *
+ * Allowed for physical type: group with value and optional metadata columns.
+ */
+struct VariantType {
+  // The version of the variant specification the variant was written with.
+  1: optional byte specification_version;
+}
+
+// Edge interpolation algorithm for the Geography logical type.
+enum EdgeInterpolationAlgorithm {
+  SPHERICAL = 0,
+  VINCENTY = 1,
+  THOMAS = 2,
+  ANDOYER = 3,
+  KARNEY = 4,
+}
+
+/**
+ * Embedded Geometry logical type annotation.
+ *
+ * Geospatial features in the Well-Known Binary (WKB) format with linear/planar
+ * edges interpolation. A custom CRS can be set by crs; if unset it defaults to
+ * "OGC:CRS84". Allowed for physical type: BYTE_ARRAY.
+ */
+struct GeometryType {
+  1: optional string crs;
+}
+
+/**
+ * Embedded Geography logical type annotation.
+ *
+ * Geospatial features in the WKB format with an explicit, non-linear edges
+ * interpolation algorithm. A custom geographic CRS can be set by crs; if unset
+ * it defaults to "OGC:CRS84". The algorithm defaults to SPHERICAL if unset.
+ * Allowed for physical type: BYTE_ARRAY.
+ */
+struct GeographyType {
+  1: optional string crs;
+  2: optional EdgeInterpolationAlgorithm algorithm;
+}
+
 /**
  * LogicalType annotations to replace ConvertedType.
  *
@@ -391,6 +437,10 @@ union LogicalType {
   12: JsonType JSON; // use ConvertedType JSON
   13: BsonType BSON; // use ConvertedType BSON
   14: UUIDType UUID;
+  15: Float16Type FLOAT16; // no compatible ConvertedType
+  16: VariantType VARIANT; // no compatible ConvertedType
+  17: GeometryType GEOMETRY; // no compatible ConvertedType
+  18: GeographyType GEOGRAPHY; // no compatible ConvertedType
 }
 
 /**
