@@ -935,6 +935,10 @@ class ColumnWriterImpl {
     if (properties_->sizeStatisticsLevel() != SizeStatisticsLevel::kNone) {
       chunkSizeStatistics_ = SizeStatistics::make(descr_);
     }
+    if (descr_->logicalType() != nullptr &&
+        descr_->logicalType()->isGeometry()) {
+      chunkGeospatialStatistics_ = std::make_shared<geospatial::GeoStatistics>();
+    }
     if (properties_->sizeStatisticsLevel() ==
         SizeStatisticsLevel::kPageAndColumnChunk) {
       pageSizeStatistics_ = SizeStatistics::make(descr_);
@@ -1101,6 +1105,7 @@ class ColumnWriterImpl {
   // Accumulated size statistics for the whole column chunk, or null when size
   // statistics collection is disabled.
   std::unique_ptr<SizeStatistics> chunkSizeStatistics_;
+  std::shared_ptr<geospatial::GeoStatistics> chunkGeospatialStatistics_;
 
   // Accumulated size statistics for the current data page, or null unless
   // page-level statistics are enabled. Reset after each page is built.
@@ -1396,6 +1401,13 @@ int64_t ColumnWriterImpl::close() {
     if (rowsWritten_ > 0 && chunkSizeStatistics_ &&
         chunkSizeStatistics_->isSet()) {
       metadata_->setSizeStatistics(*chunkSizeStatistics_);
+    }
+    if (rowsWritten_ > 0 && chunkGeospatialStatistics_ != nullptr) {
+      std::optional<geospatial::EncodedGeoStatistics> geoStats =
+          chunkGeospatialStatistics_->Encode();
+      if (geoStats.has_value()) {
+        metadata_->setGeospatialStatistics(*geoStats);
+      }
     }
     pager_->close(hasDictionary_, fallback_);
   }
@@ -2025,6 +2037,11 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
     }
     updateUnencodedByteArrayDataBytes(
         values, numValues, numValues, /*validBits=*/nullptr, 0);
+    if constexpr (std::is_same_v<T, ByteArray>) {
+      if (chunkGeospatialStatistics_ != nullptr) {
+        chunkGeospatialStatistics_->Update(values, numValues);
+      }
+    }
   }
 
   // Accumulates the unencoded BYTE_ARRAY data bytes (excluding the length
@@ -2107,6 +2124,12 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
     }
     updateUnencodedByteArrayDataBytes(
         values, numValues, numSpacedValues, validBits, validBitsOffset);
+    if constexpr (std::is_same_v<T, ByteArray>) {
+      if (chunkGeospatialStatistics_ != nullptr) {
+        chunkGeospatialStatistics_->UpdateSpaced(
+            values, validBits, validBitsOffset, numSpacedValues, numValues);
+      }
+    }
   }
 };
 
