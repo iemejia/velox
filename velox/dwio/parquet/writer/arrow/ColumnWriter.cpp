@@ -324,6 +324,11 @@ class SerializedPageWriter : public PageWriter {
 
   int64_t writeDictionaryPage(const DictionaryPage& page) override {
     int64_t uncompressedSize = page.size();
+    if (uncompressedSize > std::numeric_limits<int32_t>::max()) {
+      throw ParquetException(
+          "Uncompressed dictionary page size overflows INT32_MAX. Size:",
+          uncompressedSize);
+    }
     std::shared_ptr<Buffer> compressedData;
     if (hasCompressor()) {
       auto buffer = std::static_pointer_cast<ResizableBuffer>(
@@ -340,6 +345,11 @@ class SerializedPageWriter : public PageWriter {
     dict_page_header.is_sorted() = page.isSorted();
 
     const uint8_t* outputDataBuffer = compressedData->data();
+    if (compressedData->size() > std::numeric_limits<int32_t>::max()) {
+      throw ParquetException(
+          "Compressed dictionary page size overflows INT32_MAX. Size:",
+          compressedData->size());
+    }
     int32_t outputDataLen = static_cast<int32_t>(compressedData->size());
 
     if (dataEncryptor_.get()) {
@@ -437,8 +447,18 @@ class SerializedPageWriter : public PageWriter {
 
   int64_t writeDataPage(const DataPage& page) override {
     const int64_t uncompressedSize = page.uncompressedSize();
+    if (uncompressedSize > std::numeric_limits<int32_t>::max()) {
+      throw ParquetException(
+          "Uncompressed data page size overflows INT32_MAX. Size:",
+          uncompressedSize);
+    }
     std::shared_ptr<Buffer> compressedData = page.buffer();
     const uint8_t* outputDataBuffer = compressedData->data();
+    if (compressedData->size() > std::numeric_limits<int32_t>::max()) {
+      throw ParquetException(
+          "Compressed data page size overflows INT32_MAX. Size:",
+          compressedData->size());
+    }
     int32_t outputDataLen = static_cast<int32_t>(compressedData->size());
 
     if (dataEncryptor_.get()) {
