@@ -1704,6 +1704,12 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
       ArrowWriteContext* ctx,
       bool leafFieldNullable) override {
     BEGIN_PARQUET_CATCH_EXCEPTIONS
+    if (!leafFieldNullable && leafArray.null_count() != 0) {
+      return ::arrow::Status::Invalid(
+          "Column '",
+          descr_->name(),
+          "' is declared non-nullable but contains nulls");
+    }
     // Leaf nulls are canonical when there is only a single null element after
     // a list and it is at the leaf.
     bool singleNullableElement =
